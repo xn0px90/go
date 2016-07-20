@@ -127,7 +127,6 @@ const (
 
 const (
 	uintptrMask = 1<<(8*sys.PtrSize) - 1
-	poisonStack = uintptrMask & 0x6868686868686868
 
 	// Goroutine preemption request.
 	// Stored into g->stackguard0 to cause split stack check failure.
@@ -154,9 +153,6 @@ var stackLarge struct {
 	lock mutex
 	free [_MHeapMap_Bits]mSpanList // free lists by log_2(s.npages)
 }
-
-// Cached value of haveexperiment("framepointer")
-var framepointer_enabled bool
 
 func stackinit() {
 	if _StackCacheSize&_PageMask != 0 {
@@ -254,6 +250,8 @@ func stackpoolfree(x gclinkptr, order uint8) {
 
 // stackcacherefill/stackcacherelease implement a global pool of stack segments.
 // The pool is required to prevent unlimited growth of per-thread caches.
+//
+//go:systemstack
 func stackcacherefill(c *mcache, order uint8) {
 	if stackDebug >= 1 {
 		print("stackcacherefill order=", order, "\n")
@@ -275,6 +273,7 @@ func stackcacherefill(c *mcache, order uint8) {
 	c.stackcache[order].size = size
 }
 
+//go:systemstack
 func stackcacherelease(c *mcache, order uint8) {
 	if stackDebug >= 1 {
 		print("stackcacherelease order=", order, "\n")
@@ -293,6 +292,7 @@ func stackcacherelease(c *mcache, order uint8) {
 	c.stackcache[order].size = size
 }
 
+//go:systemstack
 func stackcache_clear(c *mcache) {
 	if stackDebug >= 1 {
 		print("stackcache clear\n")
@@ -311,6 +311,12 @@ func stackcache_clear(c *mcache) {
 	unlock(&stackpoolmu)
 }
 
+// stackalloc allocates an n byte stack.
+//
+// stackalloc must run on the system stack because it uses per-P
+// resources and must not split the stack.
+//
+//go:systemstack
 func stackalloc(n uint32) (stack, []stkbar) {
 	// Stackalloc must be called on scheduler stack, so that we
 	// never try to grow the stack during the code that stackalloc runs.
@@ -408,6 +414,12 @@ func stackalloc(n uint32) (stack, []stkbar) {
 	return stack{uintptr(v), uintptr(v) + top}, *(*[]stkbar)(unsafe.Pointer(&stkbarSlice))
 }
 
+// stackfree frees an n byte stack allocation at stk.
+//
+// stackfree must run on the system stack because it uses per-P
+// resources and must not split the stack.
+//
+//go:systemstack
 func stackfree(stk stack, n uintptr) {
 	gp := getg()
 	v := unsafe.Pointer(stk.lo)
@@ -581,7 +593,7 @@ func adjustpointers(scanp unsafe.Pointer, cbv *bitvector, adjinfo *adjustinfo, f
 			pp := (*uintptr)(add(scanp, i*sys.PtrSize))
 		retry:
 			p := *pp
-			if f != nil && 0 < p && p < _PageSize && debug.invalidptr != 0 || p == poisonStack {
+			if f != nil && 0 < p && p < _PageSize && debug.invalidptr != 0 {
 				// Looks like a junk value in a pointer slot.
 				// Live analysis wrong?
 				getg().m.traceback = 2
@@ -772,8 +784,12 @@ func syncadjustsudogs(gp *g, used uintptr, adjinfo *adjustinfo) uintptr {
 	// copystack; otherwise, gp may be in the middle of
 	// putting itself on wait queues and this would
 	// self-deadlock.
+	var lastc *hchan
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-		lock(&sg.c.lock)
+		if sg.c != lastc {
+			lock(&sg.c.lock)
+		}
+		lastc = sg.c
 	}
 
 	// Adjust sudogs.
@@ -791,8 +807,12 @@ func syncadjustsudogs(gp *g, used uintptr, adjinfo *adjustinfo) uintptr {
 	}
 
 	// Unlock channels.
+	lastc = nil
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-		unlock(&sg.c.lock)
+		if sg.c != lastc {
+			unlock(&sg.c.lock)
+		}
+		lastc = sg.c
 	}
 
 	return sgsize
@@ -1010,7 +1030,13 @@ func newstack() {
 				// return.
 			}
 			if !gp.gcscandone {
-				scanstack(gp)
+				// gcw is safe because we're on the
+				// system stack.
+				gcw := &gp.m.p.ptr().gcw
+				scanstack(gp, gcw)
+				if gcBlackenPromptly {
+					gcw.dispose()
+				}
 				gp.gcscandone = true
 			}
 			gp.preemptscan = false

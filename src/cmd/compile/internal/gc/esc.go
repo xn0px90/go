@@ -640,7 +640,7 @@ func esc(e *EscState, n *Node, up *Node) {
 	// "Big" conditions that were scattered around in walk have been gathered here
 	if n.Esc != EscHeap && n.Type != nil &&
 		(n.Type.Width > MaxStackVarSize ||
-			n.Op == ONEW && n.Type.Elem().Width >= 1<<16 ||
+			(n.Op == ONEW || n.Op == OPTRLIT) && n.Type.Elem().Width >= 1<<16 ||
 			n.Op == OMAKESLICE && !isSmallMakeSlice(n)) {
 		if Debug['m'] > 2 {
 			Warnl(n.Lineno, "%v is too large for stack", n)
@@ -900,13 +900,13 @@ func esc(e *EscState, n *Node, up *Node) {
 			escassignSinkNilWhy(e, n, n7.Right, "map literal value")
 		}
 
-		// Link addresses of captured variables to closure.
 	case OCLOSURE:
+		// Link addresses of captured variables to closure.
 		for _, v := range n.Func.Cvars.Slice() {
 			if v.Op == OXXX { // unnamed out argument; see dcl.go:/^funcargs
 				continue
 			}
-			a := v.Name.Param.Closure
+			a := v.Name.Defn
 			if !v.Name.Byval {
 				a = Nod(OADDR, a, nil)
 				a.Lineno = v.Lineno
@@ -1068,7 +1068,6 @@ func escassign(e *EscState, dst, src *Node, step *EscStep) {
 		OIND,    // dst = *x
 		ODOTPTR, // dst = (*x).f
 		ONAME,
-		OPARAM,
 		ODDDARG,
 		OPTRLIT,
 		OARRAYLIT,
@@ -1552,10 +1551,12 @@ func esccall(e *EscState, n *Node, up *Node) {
 	}
 
 	var src *Node
+	note := ""
 	i := 0
 	lls := ll.Slice()
 	for t, it := IterFields(fntype.Params()); i < len(lls); i++ {
 		src = lls[i]
+		note = t.Note
 		if t.Isddd && !n.Isddd {
 			// Introduce ODDDARG node to represent ... allocation.
 			src = Nod(ODDDARG, nil, nil)
@@ -1567,7 +1568,7 @@ func esccall(e *EscState, n *Node, up *Node) {
 		}
 
 		if haspointers(t.Type) {
-			if escassignfromtag(e, t.Note, nE.Escretval, src) == EscNone && up.Op != ODEFER && up.Op != OPROC {
+			if escassignfromtag(e, note, nE.Escretval, src) == EscNone && up.Op != ODEFER && up.Op != OPROC {
 				a := src
 				for a.Op == OCONVNOP {
 					a = a.Left
@@ -1597,14 +1598,24 @@ func esccall(e *EscState, n *Node, up *Node) {
 			// This occurs when function parameter type Isddd and n not Isddd
 			break
 		}
+
+		if note == uintptrEscapesTag {
+			escassignSinkNilWhy(e, src, src, "escaping uintptr")
+		}
+
 		t = it.Next()
 	}
 
+	// Store arguments into slice for ... arg.
 	for ; i < len(lls); i++ {
 		if Debug['m'] > 3 {
 			fmt.Printf("%v::esccall:: ... <- %v\n", linestr(lineno), Nconv(lls[i], FmtShort))
 		}
-		escassignNilWhy(e, src, lls[i], "arg to ...") // args to slice
+		if note == uintptrEscapesTag {
+			escassignSinkNilWhy(e, src, lls[i], "arg to uintptrescapes ...")
+		} else {
+			escassignNilWhy(e, src, lls[i], "arg to ...")
+		}
 	}
 }
 
@@ -1818,14 +1829,14 @@ func escwalkBody(e *EscState, level Level, dst *Node, src *Node, step *EscStep, 
 			}
 		}
 
-		// Treat a PPARAMREF closure variable as equivalent to the
+		// Treat a captured closure variable as equivalent to the
 		// original variable.
-		if src.Class == PPARAMREF {
+		if src.isClosureVar() {
 			if leaks && Debug['m'] != 0 {
 				Warnl(src.Lineno, "leaking closure reference %v", Nconv(src, FmtShort))
 				step.describe(src)
 			}
-			escwalk(e, level, dst, src.Name.Param.Closure, e.stepWalk(dst, src.Name.Param.Closure, "closure-var", step))
+			escwalk(e, level, dst, src.Name.Defn, e.stepWalk(dst, src.Name.Defn, "closure-var", step))
 		}
 
 	case OPTRLIT, OADDR:
@@ -1835,20 +1846,20 @@ func escwalkBody(e *EscState, level Level, dst *Node, src *Node, step *EscStep, 
 		}
 		if leaks {
 			src.Esc = EscHeap
-			addrescapes(src.Left)
 			if Debug['m'] != 0 && osrcesc != src.Esc {
 				p := src
 				if p.Left.Op == OCLOSURE {
 					p = p.Left // merely to satisfy error messages in tests
 				}
 				if Debug['m'] > 2 {
-					Warnl(src.Lineno, "%v escapes to heap, level=%v, dst.eld=%v, src.eld=%v",
-						Nconv(p, FmtShort), level, dstE.Escloopdepth, modSrcLoopdepth)
+					Warnl(src.Lineno, "%v escapes to heap, level=%v, dst=%v dst.eld=%v, src.eld=%v",
+						Nconv(p, FmtShort), level, dst, dstE.Escloopdepth, modSrcLoopdepth)
 				} else {
 					Warnl(src.Lineno, "%v escapes to heap", Nconv(p, FmtShort))
 					step.describe(src)
 				}
 			}
+			addrescapes(src.Left)
 			escwalkBody(e, level.dec(), dst, src.Left, e.stepWalk(dst, src.Left, why, step), modSrcLoopdepth)
 			extraloopdepth = modSrcLoopdepth // passes to recursive case, seems likely a no-op
 		} else {
@@ -1964,8 +1975,19 @@ recurse:
 // lets us take the address below to get a *string.
 var unsafeUintptrTag = "unsafe-uintptr"
 
+// This special tag is applied to uintptr parameters of functions
+// marked go:uintptrescapes.
+const uintptrEscapesTag = "uintptr-escapes"
+
 func esctag(e *EscState, func_ *Node) {
 	func_.Esc = EscFuncTagged
+
+	name := func(s *Sym, narg int) string {
+		if s != nil {
+			return s.Name
+		}
+		return fmt.Sprintf("arg#%d", narg)
+	}
 
 	// External functions are assumed unsafe,
 	// unless //go:noescape is given before the declaration.
@@ -1989,19 +2011,34 @@ func esctag(e *EscState, func_ *Node) {
 			narg++
 			if t.Type.Etype == TUINTPTR {
 				if Debug['m'] != 0 {
-					var name string
-					if t.Sym != nil {
-						name = t.Sym.Name
-					} else {
-						name = fmt.Sprintf("arg#%d", narg)
-					}
-					Warnl(func_.Lineno, "%v assuming %v is unsafe uintptr", funcSym(func_), name)
+					Warnl(func_.Lineno, "%v assuming %v is unsafe uintptr", funcSym(func_), name(t.Sym, narg))
 				}
 				t.Note = unsafeUintptrTag
 			}
 		}
 
 		return
+	}
+
+	if func_.Func.Pragma&UintptrEscapes != 0 {
+		narg := 0
+		for _, t := range func_.Type.Params().Fields().Slice() {
+			narg++
+			if t.Type.Etype == TUINTPTR {
+				if Debug['m'] != 0 {
+					Warnl(func_.Lineno, "%v marking %v as escaping uintptr", funcSym(func_), name(t.Sym, narg))
+				}
+				t.Note = uintptrEscapesTag
+			}
+
+			if t.Isddd && t.Type.Elem().Etype == TUINTPTR {
+				// final argument is ...uintptr.
+				if Debug['m'] != 0 {
+					Warnl(func_.Lineno, "%v marking %v as escaping ...uintptr", funcSym(func_), name(t.Sym, narg))
+				}
+				t.Note = uintptrEscapesTag
+			}
+		}
 	}
 
 	savefn := Curfn
@@ -2016,7 +2053,9 @@ func esctag(e *EscState, func_ *Node) {
 		case EscNone, // not touched by escflood
 			EscReturn:
 			if haspointers(ln.Type) { // don't bother tagging for scalars
-				ln.Name.Param.Field.Note = mktag(int(ln.Esc))
+				if ln.Name.Param.Field.Note != uintptrEscapesTag {
+					ln.Name.Param.Field.Note = mktag(int(ln.Esc))
+				}
 			}
 
 		case EscHeap, // touched by escflood, moved to heap

@@ -121,7 +121,7 @@ func reexportdep(n *Node) {
 	//print("reexportdep %+hN\n", n);
 	switch n.Op {
 	case ONAME:
-		switch n.Class &^ PHEAP {
+		switch n.Class {
 		// methods will be printed along with their type
 		// nodes for T.Method expressions
 		case PFUNC:
@@ -479,6 +479,10 @@ func pkgtype(s *Sym) *Type {
 	return s.Def.Type
 }
 
+// numImport tracks how often a package with a given name is imported.
+// It is used to provide a better error message (by using the package
+// path to disambiguate) if a package that appears multiple times with
+// the same name appears in an error message.
 var numImport = make(map[string]int)
 
 func importimport(s *Sym, path string) {

@@ -124,9 +124,9 @@ func TestCertificateSelection(t *testing.T) {
 func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 	clientConn, serverConn := net.Pipe()
 
-	serverConfig := *config
+	serverConfig := config.clone()
 	serverConfig.DynamicRecordSizingDisabled = false
-	tlsConn := Server(serverConn, &serverConfig)
+	tlsConn := Server(serverConn, serverConfig)
 
 	recordSizesChan := make(chan []int, 1)
 	go func() {
@@ -208,13 +208,10 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 	seenLargeRecord := false
 	for i, size := range recordSizes {
 		if !seenLargeRecord {
-			if size > tcpMSSEstimate {
-				if i < 100 {
-					t.Fatalf("Record #%d has size %d, which is too large too soon", i, size)
-				}
-				if size <= maxPlaintext {
-					t.Fatalf("Record #%d has odd size %d", i, size)
-				}
+			if size > (i+1)*tcpMSSEstimate {
+				t.Fatalf("Record #%d has size %d, which is too large too soon", i, size)
+			}
+			if size >= maxPlaintext {
 				seenLargeRecord = true
 			}
 		} else if size <= maxPlaintext {
@@ -228,19 +225,19 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 }
 
 func TestDynamicRecordSizingWithStreamCipher(t *testing.T) {
-	config := *testConfig
+	config := testConfig.clone()
 	config.CipherSuites = []uint16{TLS_RSA_WITH_RC4_128_SHA}
-	runDynamicRecordSizingTest(t, &config)
+	runDynamicRecordSizingTest(t, config)
 }
 
 func TestDynamicRecordSizingWithCBC(t *testing.T) {
-	config := *testConfig
+	config := testConfig.clone()
 	config.CipherSuites = []uint16{TLS_RSA_WITH_AES_256_CBC_SHA}
-	runDynamicRecordSizingTest(t, &config)
+	runDynamicRecordSizingTest(t, config)
 }
 
 func TestDynamicRecordSizingWithAEAD(t *testing.T) {
-	config := *testConfig
+	config := testConfig.clone()
 	config.CipherSuites = []uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}
-	runDynamicRecordSizingTest(t, &config)
+	runDynamicRecordSizingTest(t, config)
 }

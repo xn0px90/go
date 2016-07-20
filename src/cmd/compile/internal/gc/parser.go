@@ -398,11 +398,8 @@ func (p *parser) import_package() {
 		p.import_error()
 	}
 
-	importsafe := false
+	// read but skip "safe" bit (see issue #15772)
 	if p.tok == LNAME {
-		if p.sym_.Name == "safe" {
-			importsafe = true
-		}
 		p.next()
 	}
 	p.want(';')
@@ -413,7 +410,6 @@ func (p *parser) import_package() {
 	} else if importpkg.Name != name {
 		Yyerror("conflicting names %s and %s for package %q", importpkg.Name, name, importpkg.Path)
 	}
-	importpkg.Safe = importsafe
 
 	typecheckok = true
 	defercheckwidth()
@@ -2010,7 +2006,8 @@ func (p *parser) hidden_fndcl() *Node {
 		ss.Type = functype(s2[0], s6, s8)
 
 		checkwidth(ss.Type)
-		addmethod(s4, ss.Type, p.structpkg, false, false)
+		addmethod(s4, ss.Type, p.structpkg, false, p.pragma&Nointerface != 0)
+		p.pragma = 0
 		funchdr(ss)
 
 		// inl.C's inlnode in on a dotmeth node expects to find the inlineable body as

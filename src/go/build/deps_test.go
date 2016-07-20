@@ -173,7 +173,7 @@ var pkgDeps = map[string][]string{
 	"regexp":         {"L2", "regexp/syntax"},
 	"regexp/syntax":  {"L2"},
 	"runtime/debug":  {"L2", "fmt", "io/ioutil", "os", "time"},
-	"runtime/pprof":  {"L2", "fmt", "text/tabwriter"},
+	"runtime/pprof":  {"L2", "fmt", "os", "text/tabwriter"},
 	"runtime/trace":  {"L0"},
 	"text/tabwriter": {"L2"},
 
@@ -297,7 +297,7 @@ var pkgDeps = map[string][]string{
 		"context", "math/rand", "os", "sort", "syscall", "time",
 		"internal/nettrace",
 		"internal/syscall/windows", "internal/singleflight", "internal/race",
-		"golang.org/x/net/route",
+		"golang_org/x/net/route",
 	},
 
 	// NET enables use of basic network-related packages.
@@ -378,7 +378,8 @@ var pkgDeps = map[string][]string{
 		"context", "compress/gzip", "container/list", "crypto/tls",
 		"mime/multipart", "runtime/debug",
 		"net/http/internal",
-		"golang.org/x/net/http2/hpack",
+		"golang_org/x/net/http2/hpack",
+		"golang_org/x/net/lex/httplex",
 		"internal/nettrace",
 		"net/http/httptrace",
 	},
@@ -442,7 +443,7 @@ func listStdPkgs(goroot string) ([]string, error) {
 		}
 
 		name := filepath.ToSlash(path[len(src):])
-		if name == "builtin" || name == "cmd" || strings.Contains(name, ".") {
+		if name == "builtin" || name == "cmd" || strings.Contains(name, "golang_org") {
 			return filepath.SkipDir
 		}
 

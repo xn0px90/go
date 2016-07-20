@@ -1986,16 +1986,6 @@ func span6(ctxt *obj.Link, s *obj.LSym) {
 		c = naclpad(ctxt, s, c, -c&31)
 	}
 
-	// Pad functions with trap instruction, to catch invalid jumps
-	if c&(FuncAlign-1) != 0 {
-		v := -c & (FuncAlign - 1)
-		s.Grow(int64(c) + int64(v))
-		for i := c; i < c+v; i++ {
-			// 0xCC is INT $3 - breakpoint instruction
-			s.P[i] = uint8(0xCC)
-		}
-		c += v
-	}
 	s.Size = int64(c)
 
 	if false { /* debug['a'] > 1 */
@@ -3765,7 +3755,7 @@ func doasm(ctxt *obj.Link, p *obj.Prog) {
 					ctxt.Diag("directly calling duff when dynamically linking Go")
 				}
 
-				if obj.Framepointer_enabled != 0 && yt.zcase == Zcallduff && p.Mode == 64 {
+				if ctxt.Framepointer_enabled && yt.zcase == Zcallduff && p.Mode == 64 {
 					// Maintain BP around call, since duffcopy/duffzero can't do it
 					// (the call jumps into the middle of the function).
 					// This makes it possible to see call sites for duffcopy/duffzero in
@@ -3784,7 +3774,7 @@ func doasm(ctxt *obj.Link, p *obj.Prog) {
 				r.Siz = 4
 				ctxt.AsmBuf.PutInt32(0)
 
-				if obj.Framepointer_enabled != 0 && yt.zcase == Zcallduff && p.Mode == 64 {
+				if ctxt.Framepointer_enabled && yt.zcase == Zcallduff && p.Mode == 64 {
 					// Pop BP pushed above.
 					// MOVQ 0(BP), BP
 					ctxt.AsmBuf.Put(bpduff2)

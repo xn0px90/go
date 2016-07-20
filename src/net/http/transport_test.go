@@ -2060,7 +2060,8 @@ type proxyFromEnvTest struct {
 
 	env      string // HTTP_PROXY
 	httpsenv string // HTTPS_PROXY
-	noenv    string // NO_RPXY
+	noenv    string // NO_PROXY
+	reqmeth  string // REQUEST_METHOD
 
 	want    string
 	wanterr error
@@ -2083,6 +2084,10 @@ func (t proxyFromEnvTest) String() string {
 	if t.noenv != "" {
 		space()
 		fmt.Fprintf(&buf, "no_proxy=%q", t.noenv)
+	}
+	if t.reqmeth != "" {
+		space()
+		fmt.Fprintf(&buf, "request_method=%q", t.reqmeth)
 	}
 	req := "http://example.com"
 	if t.req != "" {
@@ -2107,6 +2112,12 @@ var proxyFromEnvTests = []proxyFromEnvTest{
 	{req: "https://secure.tld/", env: "http.proxy.tld", httpsenv: "secure.proxy.tld", want: "http://secure.proxy.tld"},
 	{req: "https://secure.tld/", env: "http.proxy.tld", httpsenv: "https://secure.proxy.tld", want: "https://secure.proxy.tld"},
 
+	// Issue 16405: don't use HTTP_PROXY in a CGI environment,
+	// where HTTP_PROXY can be attacker-controlled.
+	{env: "http://10.1.2.3:8080", reqmeth: "POST",
+		want:    "<nil>",
+		wanterr: errors.New("net/http: refusing to use HTTP_PROXY value in CGI environment; see golang.org/s/cgihttpproxy")},
+
 	{want: "<nil>"},
 
 	{noenv: "example.com", req: "http://example.com/", env: "proxy", want: "<nil>"},
@@ -2122,6 +2133,7 @@ func TestProxyFromEnvironment(t *testing.T) {
 		os.Setenv("HTTP_PROXY", tt.env)
 		os.Setenv("HTTPS_PROXY", tt.httpsenv)
 		os.Setenv("NO_PROXY", tt.noenv)
+		os.Setenv("REQUEST_METHOD", tt.reqmeth)
 		ResetCachedEnvironment()
 		reqURL := tt.req
 		if reqURL == "" {
@@ -2983,6 +2995,21 @@ func TestTransportAutomaticHTTP2_TLSConfig(t *testing.T) {
 func TestTransportAutomaticHTTP2_ExpectContinueTimeout(t *testing.T) {
 	testTransportAutoHTTP(t, &Transport{
 		ExpectContinueTimeout: 1 * time.Second,
+	}, true)
+}
+
+func TestTransportAutomaticHTTP2_Dial(t *testing.T) {
+	var d net.Dialer
+	testTransportAutoHTTP(t, &Transport{
+		Dial: d.Dial,
+	}, false)
+}
+
+func TestTransportAutomaticHTTP2_DialTLS(t *testing.T) {
+	testTransportAutoHTTP(t, &Transport{
+		DialTLS: func(network, addr string) (net.Conn, error) {
+			panic("unused")
+		},
 	}, false)
 }
 
@@ -3193,26 +3220,33 @@ func TestTransportResponseHeaderLength(t *testing.T) {
 	}
 }
 
-func TestTransportEventTrace(t *testing.T) { testTransportEventTrace(t, false) }
+func TestTransportEventTrace(t *testing.T)    { testTransportEventTrace(t, h1Mode, false) }
+func TestTransportEventTrace_h2(t *testing.T) { testTransportEventTrace(t, h2Mode, false) }
 
 // test a non-nil httptrace.ClientTrace but with all hooks set to zero.
-func TestTransportEventTrace_NoHooks(t *testing.T) { testTransportEventTrace(t, true) }
+func TestTransportEventTrace_NoHooks(t *testing.T)    { testTransportEventTrace(t, h1Mode, true) }
+func TestTransportEventTrace_NoHooks_h2(t *testing.T) { testTransportEventTrace(t, h2Mode, true) }
 
-func testTransportEventTrace(t *testing.T, noHooks bool) {
+func testTransportEventTrace(t *testing.T, h2 bool, noHooks bool) {
 	defer afterTest(t)
 	const resBody = "some body"
-	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+	gotWroteReqEvent := make(chan struct{})
+	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
 		if _, err := ioutil.ReadAll(r.Body); err != nil {
 			t.Error(err)
 		}
+		if !noHooks {
+			select {
+			case <-gotWroteReqEvent:
+			case <-time.After(5 * time.Second):
+				t.Error("timeout waiting for WroteRequest event")
+			}
+		}
 		io.WriteString(w, resBody)
 	}))
-	defer ts.Close()
-	tr := &Transport{
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	defer tr.CloseIdleConnections()
-	c := &Client{Transport: tr}
+	defer cst.close()
+
+	cst.tr.ExpectContinueTimeout = 1 * time.Second
 
 	var mu sync.Mutex
 	var buf bytes.Buffer
@@ -3223,7 +3257,8 @@ func testTransportEventTrace(t *testing.T, noHooks bool) {
 		buf.WriteByte('\n')
 	}
 
-	ip, port, err := net.SplitHostPort(ts.Listener.Addr().String())
+	addrStr := cst.ts.Listener.Addr().String()
+	ip, port, err := net.SplitHostPort(addrStr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3237,7 +3272,7 @@ func testTransportEventTrace(t *testing.T, noHooks bool) {
 		return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
 	})
 
-	req, _ := NewRequest("POST", "http://dns-is-faked.golang:"+port, strings.NewReader("some body"))
+	req, _ := NewRequest("POST", cst.scheme()+"://dns-is-faked.golang:"+port, strings.NewReader("some body"))
 	trace := &httptrace.ClientTrace{
 		GetConn:              func(hostPort string) { logf("Getting conn for %v ...", hostPort) },
 		GotConn:              func(ci httptrace.GotConnInfo) { logf("got conn: %+v", ci) },
@@ -3254,7 +3289,10 @@ func testTransportEventTrace(t *testing.T, noHooks bool) {
 		},
 		Wait100Continue: func() { logf("Wait100Continue") },
 		Got100Continue:  func() { logf("Got100Continue") },
-		WroteRequest:    func(e httptrace.WroteRequestInfo) { logf("WroteRequest: %+v", e) },
+		WroteRequest: func(e httptrace.WroteRequestInfo) {
+			close(gotWroteReqEvent)
+			logf("WroteRequest: %+v", e)
+		},
 	}
 	if noHooks {
 		// zero out all func pointers, trying to get some path to crash
@@ -3263,14 +3301,16 @@ func testTransportEventTrace(t *testing.T, noHooks bool) {
 	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 
 	req.Header.Set("Expect", "100-continue")
-	res, err := c.Do(req)
+	res, err := cst.c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
+	logf("got roundtrip.response")
 	slurp, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
+	logf("consumed body")
 	if string(slurp) != resBody || res.StatusCode != 200 {
 		t.Fatalf("Got %q, %v; want %q, 200 OK", slurp, res.Status, resBody)
 	}
@@ -3284,22 +3324,30 @@ func testTransportEventTrace(t *testing.T, noHooks bool) {
 	}
 
 	got := buf.String()
-	wantSub := func(sub string) {
-		if !strings.Contains(got, sub) {
-			t.Errorf("expected substring %q in output.", sub)
+	wantOnce := func(sub string) {
+		if strings.Count(got, sub) != 1 {
+			t.Errorf("expected substring %q exactly once in output.", sub)
 		}
 	}
-	wantSub("Getting conn for dns-is-faked.golang:" + port)
-	wantSub("DNS start: {Host:dns-is-faked.golang}")
-	wantSub("DNS done: {Addrs:[{IP:" + ip + " Zone:}] Err:<nil> Coalesced:false}")
-	wantSub("Connecting to tcp " + ts.Listener.Addr().String())
-	wantSub("connected to tcp " + ts.Listener.Addr().String() + " = <nil>")
-	wantSub("Reused:false WasIdle:false IdleTime:0s")
-	wantSub("first response byte")
-	wantSub("PutIdleConn = <nil>")
-	wantSub("WroteRequest: {Err:<nil>}")
-	wantSub("Wait100Continue")
-	wantSub("Got100Continue")
+	wantOnceOrMore := func(sub string) {
+		if strings.Count(got, sub) == 0 {
+			t.Errorf("expected substring %q at least once in output.", sub)
+		}
+	}
+	wantOnce("Getting conn for dns-is-faked.golang:" + port)
+	wantOnce("DNS start: {Host:dns-is-faked.golang}")
+	wantOnce("DNS done: {Addrs:[{IP:" + ip + " Zone:}] Err:<nil> Coalesced:false}")
+	wantOnce("got conn: {")
+	wantOnceOrMore("Connecting to tcp " + addrStr)
+	wantOnceOrMore("connected to tcp " + addrStr + " = <nil>")
+	wantOnce("Reused:false WasIdle:false IdleTime:0s")
+	wantOnce("first response byte")
+	if !h2 {
+		wantOnce("PutIdleConn = <nil>")
+	}
+	wantOnce("Wait100Continue")
+	wantOnce("Got100Continue")
+	wantOnce("WroteRequest: {Err:<nil>}")
 	if strings.Contains(got, " to udp ") {
 		t.Errorf("should not see UDP (DNS) connections")
 	}

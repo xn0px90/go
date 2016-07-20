@@ -103,13 +103,15 @@ type Cmd struct {
 	// available after a call to Wait or Run.
 	ProcessState *os.ProcessState
 
-	lookPathErr     error // LookPath error, if any.
-	finished        bool  // when Wait was called
+	ctx             context.Context // nil means none
+	lookPathErr     error           // LookPath error, if any.
+	finished        bool            // when Wait was called
 	childFiles      []*os.File
 	closeAfterStart []io.Closer
 	closeAfterWait  []io.Closer
 	goroutine       []func() error
 	errch           chan error // one send per goroutine
+	waitDone        chan struct{}
 }
 
 // Command returns the Cmd struct to execute the named program with
@@ -136,6 +138,20 @@ func Command(name string, arg ...string) *Cmd {
 			cmd.Path = lp
 		}
 	}
+	return cmd
+}
+
+// CommandContext is like Command but includes a context.
+//
+// The provided context is used to kill the process (by calling
+// os.Process.Kill) if the context becomes done before the command
+// completes on its own.
+func CommandContext(ctx context.Context, name string, arg ...string) *Cmd {
+	if ctx == nil {
+		panic("nil Context")
+	}
+	cmd := Command(name, arg...)
+	cmd.ctx = ctx
 	return cmd
 }
 
@@ -263,15 +279,6 @@ func (c *Cmd) Run() error {
 	return c.Wait()
 }
 
-// RunContext is like Run, but kills the process (by calling os.Process.Kill)
-// if ctx is done before the process ends on its own.
-func (c *Cmd) RunContext(ctx context.Context) error {
-	if err := c.Start(); err != nil {
-		return err
-	}
-	return c.WaitContext(ctx)
-}
-
 // lookExtensions finds windows executable by its dir and path.
 // It uses LookPath to try appropriate extensions.
 // lookExtensions does not search PATH, instead it converts `prog` into `.\prog`.
@@ -320,6 +327,15 @@ func (c *Cmd) Start() error {
 	if c.Process != nil {
 		return errors.New("exec: already started")
 	}
+	if c.ctx != nil {
+		select {
+		case <-c.ctx.Done():
+			c.closeDescriptors(c.closeAfterStart)
+			c.closeDescriptors(c.closeAfterWait)
+			return c.ctx.Err()
+		default:
+		}
+	}
 
 	type F func(*Cmd) (*os.File, error)
 	for _, setupFd := range []F{(*Cmd).stdin, (*Cmd).stdout, (*Cmd).stderr} {
@@ -353,6 +369,17 @@ func (c *Cmd) Start() error {
 		go func(fn func() error) {
 			c.errch <- fn()
 		}(fn)
+	}
+
+	if c.ctx != nil {
+		c.waitDone = make(chan struct{})
+		go func() {
+			select {
+			case <-c.ctx.Done():
+				c.Process.Kill()
+			case <-c.waitDone:
+			}
+		}()
 	}
 
 	return nil
@@ -396,12 +423,6 @@ func (e *ExitError) Error() string {
 //
 // Wait releases any resources associated with the Cmd.
 func (c *Cmd) Wait() error {
-	return c.WaitContext(nil)
-}
-
-// WaitContext is like Wait, but kills the process (by calling os.Process.Kill)
-// if ctx is done before the process ends on its own.
-func (c *Cmd) WaitContext(ctx context.Context) error {
 	if c.Process == nil {
 		return errors.New("exec: not started")
 	}
@@ -410,20 +431,9 @@ func (c *Cmd) WaitContext(ctx context.Context) error {
 	}
 	c.finished = true
 
-	var waitDone chan struct{}
-	if ctx != nil {
-		waitDone = make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				c.Process.Kill()
-			case <-waitDone:
-			}
-		}()
-	}
 	state, err := c.Process.Wait()
-	if waitDone != nil {
-		close(waitDone)
+	if c.waitDone != nil {
+		close(c.waitDone)
 	}
 	c.ProcessState = state
 

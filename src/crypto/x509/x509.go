@@ -1796,6 +1796,9 @@ var oidExtensionRequest = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 14}
 func newRawAttributes(attributes []pkix.AttributeTypeAndValueSET) ([]asn1.RawValue, error) {
 	var rawAttributes []asn1.RawValue
 	b, err := asn1.Marshal(attributes)
+	if err != nil {
+		return nil, err
+	}
 	rest, err := asn1.Unmarshal(b, &rawAttributes)
 	if err != nil {
 		return nil, err
@@ -1853,8 +1856,8 @@ func parseCSRExtensions(rawAttributes []asn1.RawValue) ([]pkix.Extension, error)
 	return ret, nil
 }
 
-// CreateCertificateRequest creates a new certificate based on a template. The
-// following members of template are used: Subject, Attributes,
+// CreateCertificateRequest creates a new certificate request based on a template.
+// The following members of template are used: Subject, Attributes,
 // SignatureAlgorithm, Extensions, DNSNames, EmailAddresses, and IPAddresses.
 // The private key is the private key of the signer.
 //

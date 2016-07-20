@@ -373,7 +373,7 @@ func ordercall(n *Node, order *Order) {
 			if t == nil {
 				break
 			}
-			if t.Note == unsafeUintptrTag {
+			if t.Note == unsafeUintptrTag || t.Note == uintptrEscapesTag {
 				xp := n.List.Addr(i)
 				for (*xp).Op == OCONVNOP && !(*xp).Type.IsPtr() {
 					xp = &(*xp).Left
@@ -385,7 +385,11 @@ func ordercall(n *Node, order *Order) {
 					*xp = x
 				}
 			}
-			t = it.Next()
+			next := it.Next()
+			if next == nil && t.Isddd && t.Note == uintptrEscapesTag {
+				next = t
+			}
+			t = next
 		}
 	}
 }
@@ -1080,6 +1084,20 @@ func orderexpr(n *Node, order *Order, lhs *Node) *Node {
 
 		if !n.Left.Type.IsInterface() {
 			n.Left = orderaddrtemp(n.Left, order)
+		}
+
+	case OCONVNOP:
+		if n.Type.IsKind(TUNSAFEPTR) && n.Left.Type.IsKind(TUINTPTR) && (n.Left.Op == OCALLFUNC || n.Left.Op == OCALLINTER || n.Left.Op == OCALLMETH) {
+			// When reordering unsafe.Pointer(f()) into a separate
+			// statement, the conversion and function call must stay
+			// together. See golang.org/issue/15329.
+			orderinit(n.Left, order)
+			ordercall(n.Left, order)
+			if lhs == nil || lhs.Op != ONAME || instrumenting {
+				n = ordercopyexpr(n, n.Type, order, 0)
+			}
+		} else {
+			n.Left = orderexpr(n.Left, order, nil)
 		}
 
 	case OANDAND, OOROR:

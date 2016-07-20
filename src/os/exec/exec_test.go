@@ -29,14 +29,22 @@ import (
 	"time"
 )
 
-func helperCommand(t *testing.T, s ...string) *exec.Cmd {
+func helperCommandContext(t *testing.T, ctx context.Context, s ...string) (cmd *exec.Cmd) {
 	testenv.MustHaveExec(t)
 
 	cs := []string{"-test.run=TestHelperProcess", "--"}
 	cs = append(cs, s...)
-	cmd := exec.Command(os.Args[0], cs...)
+	if ctx != nil {
+		cmd = exec.CommandContext(ctx, os.Args[0], cs...)
+	} else {
+		cmd = exec.Command(os.Args[0], cs...)
+	}
 	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
 	return cmd
+}
+
+func helperCommand(t *testing.T, s ...string) *exec.Cmd {
+	return helperCommandContext(t, nil, s...)
 }
 
 func TestEcho(t *testing.T) {
@@ -834,7 +842,8 @@ func TestOutputStderrCapture(t *testing.T) {
 }
 
 func TestContext(t *testing.T) {
-	c := helperCommand(t, "pipetest")
+	ctx, cancel := context.WithCancel(context.Background())
+	c := helperCommandContext(t, ctx, "pipetest")
 	stdin, err := c.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -843,7 +852,6 @@ func TestContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -858,7 +866,7 @@ func TestContext(t *testing.T) {
 	}
 	waitErr := make(chan error, 1)
 	go func() {
-		waitErr <- c.WaitContext(ctx)
+		waitErr <- c.Wait()
 	}()
 	cancel()
 	select {
@@ -868,5 +876,75 @@ func TestContext(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for child process death")
+	}
+}
+
+func TestContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := helperCommandContext(t, ctx, "cat")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Stdin = r
+
+	stdout, err := c.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		var a [1024]byte
+		for {
+			n, err := stdout.Read(a[:])
+			if err != nil {
+				if err != io.EOF {
+					t.Errorf("unexpected read error: %v", err)
+				}
+				return
+			}
+			t.Logf("%s", a[:n])
+		}
+	}()
+
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.WriteString(w, "echo"); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	// Calling cancel should have killed the process, so writes
+	// should now fail.  Give the process a little while to die.
+	start := time.Now()
+	for {
+		if _, err := io.WriteString(w, "echo"); err != nil {
+			break
+		}
+		if time.Since(start) > time.Second {
+			t.Fatal("cancelling context did not stop program")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Error("error closing write end of pipe: %v", err)
+	}
+	<-readDone
+
+	if err := c.Wait(); err == nil {
+		t.Error("program unexpectedly exited successfully")
+	} else {
+		t.Logf("exit status: %v", err)
 	}
 }

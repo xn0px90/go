@@ -44,7 +44,7 @@
 // call arbitrary Go code directly and must be careful not to allocate
 // memory or use up m->g0's stack.
 //
-// _cgoexp_GoF calls runtime.cgocallback(p.GoF, frame, framesize).
+// _cgoexp_GoF calls runtime.cgocallback(p.GoF, frame, framesize, ctxt).
 // (The reason for having _cgoexp_GoF instead of writing a crosscall3
 // to make this call directly is that _cgoexp_GoF, because it is compiled
 // with 6c instead of gcc, can refer to dotted names like
@@ -80,6 +80,7 @@
 package runtime
 
 import (
+	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
 )
@@ -145,25 +146,6 @@ func endcgo(mp *m) {
 	unlockOSThread() // invalidates mp
 }
 
-// Helper functions for cgo code.
-
-func cmalloc(n uintptr) unsafe.Pointer {
-	var args struct {
-		n   uint64
-		ret unsafe.Pointer
-	}
-	args.n = uint64(n)
-	cgocall(_cgo_malloc, unsafe.Pointer(&args))
-	if args.ret == nil {
-		throw("C malloc failed")
-	}
-	return args.ret
-}
-
-func cfree(p unsafe.Pointer) {
-	cgocall(_cgo_free, p)
-}
-
 // Call from C back to Go.
 //go:nosplit
 func cgocallbackg(ctxt uintptr) {
@@ -195,7 +177,7 @@ func cgocallbackg(ctxt uintptr) {
 
 func cgocallbackg1(ctxt uintptr) {
 	gp := getg()
-	if gp.m.needextram {
+	if gp.m.needextram || atomic.Load(&extraMWaiters) > 0 {
 		gp.m.needextram = false
 		systemstack(newextram)
 	}

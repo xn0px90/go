@@ -155,12 +155,6 @@ func main() {
 		if _cgo_thread_start == nil {
 			throw("_cgo_thread_start missing")
 		}
-		if _cgo_malloc == nil {
-			throw("_cgo_malloc missing")
-		}
-		if _cgo_free == nil {
-			throw("_cgo_free missing")
-		}
 		if GOOS != "windows" {
 			if _cgo_setenv == nil {
 				throw("_cgo_setenv missing")
@@ -273,7 +267,7 @@ func goparkunlock(lock *mutex, reason string, traceEv byte, traceskip int) {
 
 func goready(gp *g, traceskip int) {
 	systemstack(func() {
-		ready(gp, traceskip)
+		ready(gp, traceskip, true)
 	})
 }
 
@@ -440,9 +434,6 @@ func schedinit() {
 
 	sched.maxmcount = 10000
 
-	// Cache the framepointer experiment. This affects stack unwinding.
-	framepointer_enabled = haveexperiment("framepointer")
-
 	tracebackinit()
 	moduledataverify()
 	stackinit()
@@ -533,7 +524,7 @@ func mcommoninit(mp *m) {
 }
 
 // Mark gp ready to run.
-func ready(gp *g, traceskip int) {
+func ready(gp *g, traceskip int, next bool) {
 	if trace.enabled {
 		traceGoUnpark(gp, traceskip)
 	}
@@ -550,7 +541,7 @@ func ready(gp *g, traceskip int) {
 
 	// status is Gwaiting or Gscanwaiting, make Grunnable and put on runq
 	casgstatus(gp, _Gwaiting, _Grunnable)
-	runqput(_g_.m.p.ptr(), gp, true)
+	runqput(_g_.m.p.ptr(), gp, next)
 	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 { // TODO: fast atomic
 		wakep()
 	}
@@ -792,7 +783,7 @@ func casgcopystack(gp *g) uint32 {
 // scang blocks until gp's stack has been scanned.
 // It might be scanned by scang or it might be scanned by the goroutine itself.
 // Either way, the stack scan has completed when scang returns.
-func scang(gp *g) {
+func scang(gp *g, gcw *gcWork) {
 	// Invariant; we (the caller, markroot for a specific goroutine) own gp.gcscandone.
 	// Nothing is racing with us now, but gcscandone might be set to true left over
 	// from an earlier round of stack scanning (we scan twice per GC).
@@ -833,7 +824,7 @@ loop:
 			// the goroutine until we're done.
 			if castogscanstatus(gp, s, s|_Gscan) {
 				if !gp.gcscandone {
-					scanstack(gp)
+					scanstack(gp, gcw)
 					gp.gcscandone = true
 				}
 				restartg(gp)
@@ -1398,10 +1389,27 @@ func needm(x byte) {
 
 var earlycgocallback = []byte("fatal error: cgo callback before cgo call\n")
 
-// newextram allocates an m and puts it on the extra list.
+// newextram allocates m's and puts them on the extra list.
 // It is called with a working local m, so that it can do things
 // like call schedlock and allocate.
 func newextram() {
+	c := atomic.Xchg(&extraMWaiters, 0)
+	if c > 0 {
+		for i := uint32(0); i < c; i++ {
+			oneNewExtraM()
+		}
+	} else {
+		// Make sure there is at least one extra M.
+		mp := lockextra(true)
+		unlockextra(mp)
+		if mp == nil {
+			oneNewExtraM()
+		}
+	}
+}
+
+// oneNewExtraM allocates an m and puts it on the extra list.
+func oneNewExtraM() {
 	// Create extra goroutine locked to extra m.
 	// The goroutine is the context in which the cgo callback will run.
 	// The sched.pc will never be returned to, but setting it to
@@ -1494,6 +1502,7 @@ func getm() uintptr {
 }
 
 var extram uintptr
+var extraMWaiters uint32
 
 // lockextra locks the extra list and returns the list head.
 // The caller must unlock the list by storing a new list head
@@ -1504,6 +1513,7 @@ var extram uintptr
 func lockextra(nilokay bool) *m {
 	const locked = 1
 
+	incr := false
 	for {
 		old := atomic.Loaduintptr(&extram)
 		if old == locked {
@@ -1512,6 +1522,13 @@ func lockextra(nilokay bool) *m {
 			continue
 		}
 		if old == 0 && !nilokay {
+			if !incr {
+				// Add 1 to the number of threads
+				// waiting for an M.
+				// This is cleared by newextram.
+				atomic.Xadd(&extraMWaiters, 1)
+				incr = true
+			}
 			usleep(1)
 			continue
 		}
@@ -1835,7 +1852,7 @@ top:
 	}
 	if fingwait && fingwake {
 		if gp := wakefing(); gp != nil {
-			ready(gp, 0)
+			ready(gp, 0, true)
 		}
 	}
 
@@ -2445,7 +2462,12 @@ func exitsyscall(dummy int32) {
 
 	_g_.m.locks++ // see comment in entersyscall
 	if getcallersp(unsafe.Pointer(&dummy)) > _g_.syscallsp {
-		throw("exitsyscall: syscall frame is no longer valid")
+		// throw calls print which may try to grow the stack,
+		// but throwsplit == true so the stack can not be grown;
+		// use systemstack to avoid that possible problem.
+		systemstack(func() {
+			throw("exitsyscall: syscall frame is no longer valid")
+		})
 	}
 
 	_g_.waitsince = 0
@@ -3004,6 +3026,8 @@ func _ExternalCode() { _ExternalCode() }
 func _GC()           { _GC() }
 
 // Called if we receive a SIGPROF signal.
+// Called by the signal handler, may run during STW.
+//go:nowritebarrierrec
 func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	if prof.hz == 0 {
 		return
@@ -3161,6 +3185,36 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		atomic.Store(&prof.lock, 0)
 	}
 	mp.mallocing--
+}
+
+// If the signal handler receives a SIGPROF signal on a non-Go thread,
+// it tries to collect a traceback into sigprofCallers.
+// sigprofCallersUse is set to non-zero while sigprofCallers holds a traceback.
+var sigprofCallers cgoCallers
+var sigprofCallersUse uint32
+
+// Called if we receive a SIGPROF signal on a non-Go thread.
+// When this is called, sigprofCallersUse will be non-zero.
+// g is nil, and what we can do is very limited.
+//go:nosplit
+//go:nowritebarrierrec
+func sigprofNonGo() {
+	if prof.hz != 0 {
+		n := 0
+		for n < len(sigprofCallers) && sigprofCallers[n] != 0 {
+			n++
+		}
+
+		// Simple cas-lock to coordinate with setcpuprofilerate.
+		if atomic.Cas(&prof.lock, 0, 1) {
+			if prof.hz != 0 {
+				cpuprof.addNonGo(sigprofCallers[:n])
+			}
+			atomic.Store(&prof.lock, 0)
+		}
+	}
+
+	atomic.Store(&sigprofCallersUse, 0)
 }
 
 // Reports whether a function will set the SP
@@ -3798,7 +3852,7 @@ func schedtrace(detailed bool) {
 		if lockedg != nil {
 			id3 = lockedg.goid
 		}
-		print("  M", mp.id, ": p=", id1, " curg=", id2, " mallocing=", mp.mallocing, " throwing=", mp.throwing, " preemptoff=", mp.preemptoff, ""+" locks=", mp.locks, " dying=", mp.dying, " helpgc=", mp.helpgc, " spinning=", mp.spinning, " blocked=", getg().m.blocked, " lockedg=", id3, "\n")
+		print("  M", mp.id, ": p=", id1, " curg=", id2, " mallocing=", mp.mallocing, " throwing=", mp.throwing, " preemptoff=", mp.preemptoff, ""+" locks=", mp.locks, " dying=", mp.dying, " helpgc=", mp.helpgc, " spinning=", mp.spinning, " blocked=", mp.blocked, " lockedg=", id3, "\n")
 	}
 
 	lock(&allglock)
@@ -4164,6 +4218,9 @@ func setMaxThreads(in int) (out int) {
 }
 
 func haveexperiment(name string) bool {
+	if name == "framepointer" {
+		return framepointer_enabled // set by linker
+	}
 	x := sys.Goexperiment
 	for x != "" {
 		xname := ""
@@ -4175,6 +4232,9 @@ func haveexperiment(name string) bool {
 		}
 		if xname == name {
 			return true
+		}
+		if len(xname) > 2 && xname[:2] == "no" && xname[2:] == name {
+			return false
 		}
 	}
 	return false

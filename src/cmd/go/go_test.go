@@ -489,6 +489,16 @@ func (tg *testgoData) path(name string) string {
 	return filepath.Join(tg.tempdir, name)
 }
 
+// mustExist fails if path does not exist.
+func (tg *testgoData) mustExist(path string) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			tg.t.Fatalf("%s does not exist but should", path)
+		}
+		tg.t.Fatalf("%s stat failed: %v", path, err)
+	}
+}
+
 // mustNotExist fails if path exists.
 func (tg *testgoData) mustNotExist(path string) {
 	if _, err := os.Stat(path); err == nil || !os.IsNotExist(err) {
@@ -1151,7 +1161,7 @@ func TestImportCommentConflict(t *testing.T) {
 	tg.grepStderr("found import comments", "go build did not mention comment conflict")
 }
 
-// cmd/go: custom import path checking should not apply to github.com/xxx/yyy.
+// cmd/go: custom import path checking should not apply to Go packages without import comment.
 func TestIssue10952(t *testing.T) {
 	testenv.MustHaveExternalNetwork(t)
 	if _, err := exec.LookPath("git"); err != nil {
@@ -1168,6 +1178,34 @@ func TestIssue10952(t *testing.T) {
 	repoDir := tg.path("src/" + importPath)
 	tg.runGit(repoDir, "remote", "set-url", "origin", "https://"+importPath+".git")
 	tg.run("get", "-d", "-u", importPath)
+}
+
+// Test git clone URL that uses SCP-like syntax and custom import path checking.
+func TestIssue11457(t *testing.T) {
+	testenv.MustHaveExternalNetwork(t)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("skipping because git binary not found")
+	}
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.tempDir("src")
+	tg.setenv("GOPATH", tg.path("."))
+	const importPath = "github.com/rsc/go-get-issue-11457"
+	tg.run("get", "-d", "-u", importPath)
+	repoDir := tg.path("src/" + importPath)
+	tg.runGit(repoDir, "remote", "set-url", "origin", "git@github.com:rsc/go-get-issue-11457")
+
+	// At this time, custom import path checking compares remotes verbatim (rather than
+	// just the host and path, skipping scheme and user), so we expect go get -u to fail.
+	// However, the goal of this test is to verify that gitRemoteRepo correctly parsed
+	// the SCP-like syntax, and we expect it to appear in the error message.
+	tg.runFail("get", "-d", "-u", importPath)
+	want := " is checked out from ssh://git@github.com/rsc/go-get-issue-11457"
+	if !strings.HasSuffix(strings.TrimSpace(tg.getStderr()), want) {
+		t.Error("expected clone URL to appear in stderr")
+	}
 }
 
 func TestGetGitDefaultBranch(t *testing.T) {
@@ -1304,15 +1342,31 @@ func TestPackageMainTestImportsArchiveNotBinary(t *testing.T) {
 	tg.run("test", "main_test")
 }
 
+// The runtime version string takes one of two forms:
+// "go1.X[.Y]" for Go releases, and "devel +hash" at tip.
+// Determine whether we are in a released copy by
+// inspecting the version.
+var isGoRelease = strings.HasPrefix(runtime.Version(), "go1")
+
 // Issue 12690
 func TestPackageNotStaleWithTrailingSlash(t *testing.T) {
 	tg := testgo(t)
 	defer tg.cleanup()
+
+	// Make sure the packages below are not stale.
+	tg.run("install", "runtime", "os", "io")
+
 	goroot := runtime.GOROOT()
 	tg.setenv("GOROOT", goroot+"/")
-	tg.wantNotStale("runtime", "", "with trailing slash in GOROOT, runtime listed as stale")
-	tg.wantNotStale("os", "", "with trailing slash in GOROOT, os listed as stale")
-	tg.wantNotStale("io", "", "with trailing slash in GOROOT, io listed as stale")
+
+	want := ""
+	if isGoRelease {
+		want = "standard package in Go release distribution"
+	}
+
+	tg.wantNotStale("runtime", want, "with trailing slash in GOROOT, runtime listed as stale")
+	tg.wantNotStale("os", want, "with trailing slash in GOROOT, os listed as stale")
+	tg.wantNotStale("io", want, "with trailing slash in GOROOT, io listed as stale")
 }
 
 // With $GOBIN set, binaries get installed to $GOBIN.
@@ -2314,6 +2368,11 @@ func TestGoGetRscIoToolstash(t *testing.T) {
 // Issue 13037: Was not parsing <meta> tags in 404 served over HTTPS
 func TestGoGetHTTPS404(t *testing.T) {
 	testenv.MustHaveExternalNetwork(t)
+	switch runtime.GOOS {
+	case "darwin", "linux", "freebsd":
+	default:
+		t.Skipf("test case does not work on %s", runtime.GOOS)
+	}
 
 	tg := testgo(t)
 	defer tg.cleanup()
@@ -2804,7 +2863,8 @@ func TestBinaryOnlyPackages(t *testing.T) {
 	os.Remove(tg.path("src/p1/p1.go"))
 	tg.mustNotExist(tg.path("src/p1/p1.go"))
 
-	tg.tempFile("src/p2/p2.go", `
+	tg.tempFile("src/p2/p2.go", `//go:binary-only-packages-are-not-great
+
 		package p2
 		import "p1"
 		func F() { p1.F(true) }
@@ -2813,7 +2873,7 @@ func TestBinaryOnlyPackages(t *testing.T) {
 	tg.grepStderr("no buildable Go source files", "did not complain about missing sources")
 
 	tg.tempFile("src/p1/missing.go", `//go:binary-only-package
-	
+
 		package p1
 		func G()
 	`)
@@ -2847,4 +2907,50 @@ func TestBinaryOnlyPackages(t *testing.T) {
 
 	tg.run("run", tg.path("src/p3/p3.go"))
 	tg.grepStdout("hello from p1", "did not see message from p1")
+}
+
+// Issue 16050.
+func TestAlwaysLinkSysoFiles(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.tempDir("src/syso")
+	tg.tempFile("src/syso/a.syso", ``)
+	tg.tempFile("src/syso/b.go", `package syso`)
+	tg.setenv("GOPATH", tg.path("."))
+
+	// We should see the .syso file regardless of the setting of
+	// CGO_ENABLED.
+
+	tg.setenv("CGO_ENABLED", "1")
+	tg.run("list", "-f", "{{.SysoFiles}}", "syso")
+	tg.grepStdout("a.syso", "missing syso file with CGO_ENABLED=1")
+
+	tg.setenv("CGO_ENABLED", "0")
+	tg.run("list", "-f", "{{.SysoFiles}}", "syso")
+	tg.grepStdout("a.syso", "missing syso file with CGO_ENABLED=0")
+}
+
+// Issue 16120.
+func TestGenerateUsesBuildContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this test won't run under Windows")
+	}
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.tempDir("src/gen")
+	tg.tempFile("src/gen/gen.go", "package gen\n//go:generate echo $GOOS $GOARCH\n")
+	tg.setenv("GOPATH", tg.path("."))
+
+	tg.setenv("GOOS", "linux")
+	tg.setenv("GOARCH", "amd64")
+	tg.run("generate", "gen")
+	tg.grepStdout("linux amd64", "unexpected GOOS/GOARCH combination")
+
+	tg.setenv("GOOS", "darwin")
+	tg.setenv("GOARCH", "386")
+	tg.run("generate", "gen")
+	tg.grepStdout("darwin 386", "unexpected GOOS/GOARCH combination")
 }

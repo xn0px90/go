@@ -108,6 +108,8 @@ func Main() {
 
 	localpkg = mkpkg("")
 	localpkg.Prefix = "\"\""
+	autopkg = mkpkg("")
+	autopkg.Prefix = "\"\""
 
 	// pseudo-package, for scoping
 	builtinpkg = mkpkg("go.builtin")
@@ -781,6 +783,21 @@ func importfile(f *Val, indent []byte) {
 		if p[10:] != q {
 			Yyerror("import %s: object is [%s] expected [%s]", file, p[10:], q)
 			errorexit()
+		}
+	}
+
+	// process header lines
+	for {
+		p, err = imp.ReadString('\n')
+		if err != nil {
+			log.Fatalf("reading input: %v", err)
+		}
+		if p == "\n" {
+			break // header ends with blank line
+		}
+		if strings.HasPrefix(p, "safe") {
+			importpkg.Safe = true
+			break // ok to ignore rest
 		}
 	}
 
