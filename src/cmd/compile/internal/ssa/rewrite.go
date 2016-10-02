@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 )
 
-func applyRewrite(f *Func, rb func(*Block) bool, rv func(*Value, *Config) bool) {
+func applyRewrite(f *Func, rb func(*Block, *Config) bool, rv func(*Value, *Config) bool) {
 	// repeat rewrites until we find no more rewrites
 	var curb *Block
 	var curv *Value
@@ -34,7 +34,7 @@ func applyRewrite(f *Func, rb func(*Block) bool, rv func(*Value, *Config) bool) 
 				}
 			}
 			curb = b
-			if rb(b) {
+			if rb(b, config) {
 				change = true
 			}
 			curb = nil
@@ -149,6 +149,24 @@ func canMergeSym(x, y interface{}) bool {
 	return x == nil || y == nil
 }
 
+// isArg returns whether s is an arg symbol
+func isArg(s interface{}) bool {
+	_, ok := s.(*ArgSymbol)
+	return ok
+}
+
+// isAuto returns whether s is an auto symbol
+func isAuto(s interface{}) bool {
+	_, ok := s.(*AutoSymbol)
+	return ok
+}
+
+// isSameSym returns whether sym is the same as the given named symbol
+func isSameSym(sym interface{}, name string) bool {
+	s, ok := sym.(fmt.Stringer)
+	return ok && s.String() == name
+}
+
 // nlz returns the number of leading zeros.
 func nlz(x int64) int64 {
 	// log2(0) == 1, so nlz(0) == 64
@@ -171,6 +189,7 @@ func nto(x int64) int64 {
 }
 
 // log2 returns logarithm in base of uint64(n), with log2(0) = -1.
+// Rounds down.
 func log2(n int64) (l int64) {
 	l = -1
 	x := uint64(n)
@@ -203,6 +222,21 @@ func isPowerOfTwo(n int64) bool {
 // is32Bit reports whether n can be represented as a signed 32 bit integer.
 func is32Bit(n int64) bool {
 	return n == int64(int32(n))
+}
+
+// is16Bit reports whether n can be represented as a signed 16 bit integer.
+func is16Bit(n int64) bool {
+	return n == int64(int16(n))
+}
+
+// is16Bit reports whether n can be represented as an unsigned 16 bit integer.
+func isU16Bit(n int64) bool {
+	return n == int64(uint16(n))
+}
+
+// is20Bit reports whether n can be represented as a signed 20 bit integer.
+func is20Bit(n int64) bool {
+	return -(1<<19) <= n && n < (1<<19)
 }
 
 // b2i translates a boolean value to 0 or 1 for assigning to auxInt.
@@ -254,50 +288,17 @@ func isSamePtr(p1, p2 *Value) bool {
 	return false
 }
 
-// DUFFZERO consists of repeated blocks of 4 MOVUPSs + ADD,
-// See runtime/mkduff.go.
-const (
-	dzBlocks    = 16 // number of MOV/ADD blocks
-	dzBlockLen  = 4  // number of clears per block
-	dzBlockSize = 19 // size of instructions in a single block
-	dzMovSize   = 4  // size of single MOV instruction w/ offset
-	dzAddSize   = 4  // size of single ADD instruction
-	dzClearStep = 16 // number of bytes cleared by each MOV instruction
-
-	dzTailLen  = 4 // number of final STOSQ instructions
-	dzTailSize = 2 // size of single STOSQ instruction
-
-	dzClearLen = dzClearStep * dzBlockLen // bytes cleared by one block
-	dzSize     = dzBlocks * dzBlockSize
-)
-
-func duffStart(size int64) int64 {
-	x, _ := duff(size)
-	return x
-}
-func duffAdj(size int64) int64 {
-	_, x := duff(size)
-	return x
-}
-
-// duff returns the offset (from duffzero, in bytes) and pointer adjust (in bytes)
-// required to use the duffzero mechanism for a block of the given size.
-func duff(size int64) (int64, int64) {
-	if size < 32 || size > 1024 || size%dzClearStep != 0 {
-		panic("bad duffzero size")
+// moveSize returns the number of bytes an aligned MOV instruction moves
+func moveSize(align int64, c *Config) int64 {
+	switch {
+	case align%8 == 0 && c.IntSize == 8:
+		return 8
+	case align%4 == 0:
+		return 4
+	case align%2 == 0:
+		return 2
 	}
-	// TODO: arch-dependent
-	steps := size / dzClearStep
-	blocks := steps / dzBlockLen
-	steps %= dzBlockLen
-	off := dzBlockSize * (dzBlocks - blocks)
-	var adj int64
-	if steps != 0 {
-		off -= dzAddSize
-		off -= dzMovSize * steps
-		adj -= dzClearStep * (dzBlockLen - steps)
-	}
-	return off, adj
+	return 1
 }
 
 // mergePoint finds a block among a's blocks which dominates b and is itself
@@ -357,6 +358,24 @@ found:
 func clobber(v *Value) bool {
 	v.reset(OpInvalid)
 	// Note: leave v.Block intact.  The Block field is used after clobber.
+	return true
+}
+
+// noteRule is an easy way to track if a rule is matched when writing
+// new ones.  Make the rule of interest also conditional on
+//     noteRule("note to self: rule of interest matched")
+// and that message will print when the rule matches.
+func noteRule(s string) bool {
+	println(s)
+	return true
+}
+
+// warnRule generates a compiler debug output with string s when
+// cond is true and the rule is fired.
+func warnRule(cond bool, v *Value, s string) bool {
+	if cond {
+		v.Block.Func.Config.Warnl(v.Line, "removed nil check")
+	}
 	return true
 }
 

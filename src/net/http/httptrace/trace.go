@@ -1,6 +1,6 @@
 // Copyright 2016 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.h
+// license that can be found in the LICENSE file.
 
 // Package httptrace provides mechanisms to trace the events within
 // HTTP client requests.
@@ -65,8 +65,8 @@ func WithClientTrace(ctx context.Context, trace *ClientTrace) context.Context {
 	return ctx
 }
 
-// ClientTrace is a set of hooks to run at various stages of an HTTP
-// client request. Any particular hook may be nil. Functions may be
+// ClientTrace is a set of hooks to run at various stages of an outgoing
+// HTTP request. Any particular hook may be nil. Functions may be
 // called concurrently from different goroutines, starting after the
 // call to Transport.RoundTrip and ending either when RoundTrip
 // returns an error, or when the Response.Body is closed.

@@ -1718,8 +1718,17 @@ func testCancelRequestWithChannelBeforeDo(t *testing.T, withCtx bool) {
 	}
 
 	_, err := c.Do(req)
-	if err == nil || !strings.Contains(err.Error(), "canceled") {
-		t.Errorf("Do error = %v; want cancelation", err)
+	if ue, ok := err.(*url.Error); ok {
+		err = ue.Err
+	}
+	if withCtx {
+		if err != context.Canceled {
+			t.Errorf("Do error = %v; want %v", err, context.Canceled)
+		}
+	} else {
+		if err == nil || !strings.Contains(err.Error(), "canceled") {
+			t.Errorf("Do error = %v; want cancelation", err)
+		}
 	}
 }
 
@@ -3248,7 +3257,7 @@ func testTransportEventTrace(t *testing.T, h2 bool, noHooks bool) {
 
 	cst.tr.ExpectContinueTimeout = 1 * time.Second
 
-	var mu sync.Mutex
+	var mu sync.Mutex // guards buf
 	var buf bytes.Buffer
 	logf := func(format string, args ...interface{}) {
 		mu.Lock()
@@ -3290,8 +3299,8 @@ func testTransportEventTrace(t *testing.T, h2 bool, noHooks bool) {
 		Wait100Continue: func() { logf("Wait100Continue") },
 		Got100Continue:  func() { logf("Got100Continue") },
 		WroteRequest: func(e httptrace.WroteRequestInfo) {
-			close(gotWroteReqEvent)
 			logf("WroteRequest: %+v", e)
+			close(gotWroteReqEvent)
 		},
 	}
 	if noHooks {
@@ -3323,7 +3332,10 @@ func testTransportEventTrace(t *testing.T, h2 bool, noHooks bool) {
 		return
 	}
 
+	mu.Lock()
 	got := buf.String()
+	mu.Unlock()
+
 	wantOnce := func(sub string) {
 		if strings.Count(got, sub) != 1 {
 			t.Errorf("expected substring %q exactly once in output.", sub)
@@ -3357,12 +3369,21 @@ func testTransportEventTrace(t *testing.T, h2 bool, noHooks bool) {
 }
 
 func TestTransportEventTraceRealDNS(t *testing.T) {
+	if testing.Short() && testenv.Builder() == "" {
+		// Skip this test in short mode (the default for
+		// all.bash), in case the user is using a shady/ISP
+		// DNS server hijacking queries.
+		// See issues 16732, 16716.
+		// Our builders use 8.8.8.8, though, which correctly
+		// returns NXDOMAIN, so still run this test there.
+		t.Skip("skipping in short mode")
+	}
 	defer afterTest(t)
 	tr := &Transport{}
 	defer tr.CloseIdleConnections()
 	c := &Client{Transport: tr}
 
-	var mu sync.Mutex
+	var mu sync.Mutex // guards buf
 	var buf bytes.Buffer
 	logf := func(format string, args ...interface{}) {
 		mu.Lock()
@@ -3386,7 +3407,10 @@ func TestTransportEventTraceRealDNS(t *testing.T) {
 		t.Fatal("expected error during DNS lookup")
 	}
 
+	mu.Lock()
 	got := buf.String()
+	mu.Unlock()
+
 	wantSub := func(sub string) {
 		if !strings.Contains(got, sub) {
 			t.Errorf("expected substring %q in output.", sub)
@@ -3457,27 +3481,36 @@ func TestTransportMaxIdleConns(t *testing.T) {
 	}
 }
 
-func TestTransportIdleConnTimeout(t *testing.T) {
+func TestTransportIdleConnTimeout_h1(t *testing.T) { testTransportIdleConnTimeout(t, h1Mode) }
+func TestTransportIdleConnTimeout_h2(t *testing.T) { testTransportIdleConnTimeout(t, h2Mode) }
+func testTransportIdleConnTimeout(t *testing.T, h2 bool) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
 	defer afterTest(t)
 
-	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+	const timeout = 1 * time.Second
+
+	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
 		// No body for convenience.
 	}))
-	defer ts.Close()
-
-	const timeout = 1 * time.Second
-	tr := &Transport{
-		IdleConnTimeout: timeout,
-	}
+	defer cst.close()
+	tr := cst.tr
+	tr.IdleConnTimeout = timeout
 	defer tr.CloseIdleConnections()
 	c := &Client{Transport: tr}
 
+	idleConns := func() []string {
+		if h2 {
+			return tr.IdleConnStrsForTesting_h2()
+		} else {
+			return tr.IdleConnStrsForTesting()
+		}
+	}
+
 	var conn string
 	doReq := func(n int) {
-		req, _ := NewRequest("GET", ts.URL, nil)
+		req, _ := NewRequest("GET", cst.ts.URL, nil)
 		req = req.WithContext(httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
 			PutIdleConn: func(err error) {
 				if err != nil {
@@ -3490,7 +3523,7 @@ func TestTransportIdleConnTimeout(t *testing.T) {
 			t.Fatal(err)
 		}
 		res.Body.Close()
-		conns := tr.IdleConnStrsForTesting()
+		conns := idleConns()
 		if len(conns) != 1 {
 			t.Fatalf("req %v: unexpected number of idle conns: %q", n, conns)
 		}
@@ -3506,8 +3539,172 @@ func TestTransportIdleConnTimeout(t *testing.T) {
 		time.Sleep(timeout / 2)
 	}
 	time.Sleep(timeout * 3 / 2)
-	if got := tr.IdleConnStrsForTesting(); len(got) != 0 {
+	if got := idleConns(); len(got) != 0 {
 		t.Errorf("idle conns = %q; want none", got)
+	}
+}
+
+// Issue 16208: Go 1.7 crashed after Transport.IdleConnTimeout if an
+// HTTP/2 connection was established but but its caller no longer
+// wanted it. (Assuming the connection cache was enabled, which it is
+// by default)
+//
+// This test reproduced the crash by setting the IdleConnTimeout low
+// (to make the test reasonable) and then making a request which is
+// canceled by the DialTLS hook, which then also waits to return the
+// real connection until after the RoundTrip saw the error.  Then we
+// know the successful tls.Dial from DialTLS will need to go into the
+// idle pool. Then we give it a of time to explode.
+func TestIdleConnH2Crash(t *testing.T) {
+	cst := newClientServerTest(t, h2Mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		// nothing
+	}))
+	defer cst.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gotErr := make(chan bool, 1)
+
+	cst.tr.IdleConnTimeout = 5 * time.Millisecond
+	cst.tr.DialTLS = func(network, addr string) (net.Conn, error) {
+		cancel()
+		<-gotErr
+		c, err := tls.Dial(network, addr, &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		})
+		if err != nil {
+			t.Error(err)
+			return nil, err
+		}
+		if cs := c.ConnectionState(); cs.NegotiatedProtocol != "h2" {
+			t.Errorf("protocol = %q; want %q", cs.NegotiatedProtocol, "h2")
+			c.Close()
+			return nil, errors.New("bogus")
+		}
+		return c, nil
+	}
+
+	req, _ := NewRequest("GET", cst.ts.URL, nil)
+	req = req.WithContext(ctx)
+	res, err := cst.c.Do(req)
+	if err == nil {
+		res.Body.Close()
+		t.Fatal("unexpected success")
+	}
+	gotErr <- true
+
+	// Wait for the explosion.
+	time.Sleep(cst.tr.IdleConnTimeout * 10)
+}
+
+type funcConn struct {
+	net.Conn
+	read  func([]byte) (int, error)
+	write func([]byte) (int, error)
+}
+
+func (c funcConn) Read(p []byte) (int, error)  { return c.read(p) }
+func (c funcConn) Write(p []byte) (int, error) { return c.write(p) }
+func (c funcConn) Close() error                { return nil }
+
+// Issue 16465: Transport.RoundTrip should return the raw net.Conn.Read error from Peek
+// back to the caller.
+func TestTransportReturnsPeekError(t *testing.T) {
+	errValue := errors.New("specific error value")
+
+	wrote := make(chan struct{})
+	var wroteOnce sync.Once
+
+	tr := &Transport{
+		Dial: func(network, addr string) (net.Conn, error) {
+			c := funcConn{
+				read: func([]byte) (int, error) {
+					<-wrote
+					return 0, errValue
+				},
+				write: func(p []byte) (int, error) {
+					wroteOnce.Do(func() { close(wrote) })
+					return len(p), nil
+				},
+			}
+			return c, nil
+		},
+	}
+	_, err := tr.RoundTrip(httptest.NewRequest("GET", "http://fake.tld/", nil))
+	if err != errValue {
+		t.Errorf("error = %#v; want %v", err, errValue)
+	}
+}
+
+// Issue 13835: international domain names should work
+func TestTransportIDNA_h1(t *testing.T) { testTransportIDNA(t, h1Mode) }
+func TestTransportIDNA_h2(t *testing.T) { testTransportIDNA(t, h2Mode) }
+func testTransportIDNA(t *testing.T, h2 bool) {
+	defer afterTest(t)
+
+	const uniDomain = "гофер.го"
+	const punyDomain = "xn--c1ae0ajs.xn--c1aw"
+
+	var port string
+	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
+		want := punyDomain + ":" + port
+		if r.Host != want {
+			t.Errorf("Host header = %q; want %q", r.Host, want)
+		}
+		if h2 {
+			if r.TLS == nil {
+				t.Errorf("r.TLS == nil")
+			} else if r.TLS.ServerName != punyDomain {
+				t.Errorf("TLS.ServerName = %q; want %q", r.TLS.ServerName, punyDomain)
+			}
+		}
+		w.Header().Set("Hit-Handler", "1")
+	}))
+	defer cst.close()
+
+	ip, port, err := net.SplitHostPort(cst.ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Install a fake DNS server.
+	ctx := context.WithValue(context.Background(), nettrace.LookupIPAltResolverKey{}, func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		if host != punyDomain {
+			t.Errorf("got DNS host lookup for %q; want %q", host, punyDomain)
+			return nil, nil
+		}
+		return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
+	})
+
+	req, _ := NewRequest("GET", cst.scheme()+"://"+uniDomain+":"+port, nil)
+	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			want := net.JoinHostPort(punyDomain, port)
+			if hostPort != want {
+				t.Errorf("getting conn for %q; want %q", hostPort, want)
+			}
+		},
+		DNSStart: func(e httptrace.DNSStartInfo) {
+			if e.Host != punyDomain {
+				t.Errorf("DNSStart Host = %q; want %q", e.Host, punyDomain)
+			}
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
+
+	res, err := cst.tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.Header.Get("Hit-Handler") != "1" {
+		out, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Errorf("Response body wasn't from Handler. Got:\n%s\n", out)
 	}
 }
 

@@ -161,7 +161,7 @@ func register(name, usage string, fn func(*File, ast.Node), types ...ast.Node) {
 
 // Usage is a replacement usage function for the flags package.
 func Usage() {
-	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage of vet:\n")
 	fmt.Fprintf(os.Stderr, "\tvet [flags] directory...\n")
 	fmt.Fprintf(os.Stderr, "\tvet [flags] files... # Must be a single package\n")
 	fmt.Fprintf(os.Stderr, "By default, -all is set and all non-experimental checks are run.\n")
@@ -440,14 +440,22 @@ func (f *File) loc(pos token.Pos) string {
 	return fmt.Sprintf("%s:%d", posn.Filename, posn.Line)
 }
 
+// locPrefix returns a formatted representation of the position for use as a line prefix.
+func (f *File) locPrefix(pos token.Pos) string {
+	if pos == token.NoPos {
+		return ""
+	}
+	return fmt.Sprintf("%s: ", f.loc(pos))
+}
+
 // Warn reports an error but does not set the exit code.
 func (f *File) Warn(pos token.Pos, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "%s: %s", f.loc(pos), fmt.Sprintln(args...))
+	fmt.Fprintf(os.Stderr, "%s%s", f.locPrefix(pos), fmt.Sprintln(args...))
 }
 
 // Warnf reports a formatted error but does not set the exit code.
 func (f *File) Warnf(pos token.Pos, format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "%s: %s\n", f.loc(pos), fmt.Sprintf(format, args...))
+	fmt.Fprintf(os.Stderr, "%s%s\n", f.locPrefix(pos), fmt.Sprintf(format, args...))
 }
 
 // walkFile walks the file's tree.

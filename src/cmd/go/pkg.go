@@ -691,24 +691,23 @@ const (
 
 // goTools is a map of Go program import path to install target directory.
 var goTools = map[string]targetDir{
-	"cmd/addr2line":                        toTool,
-	"cmd/api":                              toTool,
-	"cmd/asm":                              toTool,
-	"cmd/compile":                          toTool,
-	"cmd/cgo":                              toTool,
-	"cmd/cover":                            toTool,
-	"cmd/dist":                             toTool,
-	"cmd/doc":                              toTool,
-	"cmd/fix":                              toTool,
-	"cmd/link":                             toTool,
-	"cmd/newlink":                          toTool,
-	"cmd/nm":                               toTool,
-	"cmd/objdump":                          toTool,
-	"cmd/pack":                             toTool,
-	"cmd/pprof":                            toTool,
-	"cmd/trace":                            toTool,
-	"cmd/vet":                              toTool,
-	"cmd/yacc":                             toTool,
+	"cmd/addr2line": toTool,
+	"cmd/api":       toTool,
+	"cmd/asm":       toTool,
+	"cmd/compile":   toTool,
+	"cmd/cgo":       toTool,
+	"cmd/cover":     toTool,
+	"cmd/dist":      toTool,
+	"cmd/doc":       toTool,
+	"cmd/fix":       toTool,
+	"cmd/link":      toTool,
+	"cmd/newlink":   toTool,
+	"cmd/nm":        toTool,
+	"cmd/objdump":   toTool,
+	"cmd/pack":      toTool,
+	"cmd/pprof":     toTool,
+	"cmd/trace":     toTool,
+	"cmd/vet":       toTool,
 	"code.google.com/p/go.tools/cmd/cover": stalePath,
 	"code.google.com/p/go.tools/cmd/godoc": stalePath,
 	"code.google.com/p/go.tools/cmd/vet":   stalePath,
@@ -776,7 +775,7 @@ func (p *Package) load(stk *importStack, bp *build.Package, err error) *Package 
 	useBindir := p.Name == "main"
 	if !p.Standard {
 		switch buildBuildmode {
-		case "c-archive", "c-shared":
+		case "c-archive", "c-shared", "plugin":
 			useBindir = false
 		}
 	}
@@ -847,10 +846,11 @@ func (p *Package) load(stk *importStack, bp *build.Package, err error) *Package 
 		importPaths = append(importPaths, "syscall")
 	}
 
-	// Currently build modes c-shared, pie, and -linkshared force
+	// Currently build modes c-shared, pie, plugin, and -linkshared force
 	// external linking mode, and external linking mode forces an
 	// import of runtime/cgo.
-	if p.Name == "main" && !p.Goroot && (buildBuildmode == "c-shared" || buildBuildmode == "pie" || buildLinkshared) {
+	pieCgo := buildBuildmode == "pie" && (buildContext.GOOS != "linux" || buildContext.GOARCH != "amd64")
+	if p.Name == "main" && !p.Goroot && (buildBuildmode == "c-shared" || buildBuildmode == "plugin" || pieCgo || buildLinkshared) {
 		importPaths = append(importPaths, "runtime/cgo")
 	}
 

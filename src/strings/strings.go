@@ -176,17 +176,11 @@ func LastIndex(s, sep string) int {
 // IndexRune returns the index of the first instance of the Unicode code point
 // r, or -1 if rune is not present in s.
 func IndexRune(s string, r rune) int {
-	switch {
-	case r < utf8.RuneSelf:
+	if r < utf8.RuneSelf {
 		return IndexByte(s, byte(r))
-	default:
-		for i, c := range s {
-			if c == r {
-				return i
-			}
-		}
 	}
-	return -1
+
+	return Index(s, string(r))
 }
 
 // IndexAny returns the index of the first instance of any Unicode code point
@@ -342,11 +336,19 @@ func FieldsFunc(s string, f func(rune) bool) []string {
 // Join concatenates the elements of a to create a single string. The separator string
 // sep is placed between elements in the resulting string.
 func Join(a []string, sep string) string {
-	if len(a) == 0 {
+	switch len(a) {
+	case 0:
 		return ""
-	}
-	if len(a) == 1 {
+	case 1:
 		return a[0]
+	case 2:
+		// Special case for common small values.
+		// Remove if golang.org/issue/6714 is fixed
+		return a[0] + sep + a[1]
+	case 3:
+		// Special case for common small values.
+		// Remove if golang.org/issue/6714 is fixed
+		return a[0] + sep + a[1] + sep + a[2]
 	}
 	n := len(sep) * (len(a) - 1)
 	for i := 0; i < len(a); i++ {
@@ -416,7 +418,20 @@ func Map(mapping func(rune) rune, s string) string {
 }
 
 // Repeat returns a new string consisting of count copies of the string s.
+//
+// It panics if count is negative or if
+// the result of (len(s) * count) overflows.
 func Repeat(s string, count int) string {
+	// Since we cannot return an error on overflow,
+	// we should panic if the repeat will generate
+	// an overflow.
+	// See Issue golang.org/issue/16237
+	if count < 0 {
+		panic("strings: negative Repeat count")
+	} else if count > 0 && len(s)*count/count != len(s) {
+		panic("strings: Repeat count causes overflow")
+	}
+
 	b := make([]byte, len(s)*count)
 	bp := copy(b, s)
 	for bp < len(b) {

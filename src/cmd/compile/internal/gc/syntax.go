@@ -60,12 +60,12 @@ type Node struct {
 	Colas     bool  // OAS resulting from :=
 	Diag      uint8 // already printed error about this
 	Noescape  bool  // func arguments do not escape; TODO(rsc): move Noescape to Func struct (see CL 7360)
-	Walkdef   uint8
-	Typecheck uint8
+	Walkdef   uint8 // tracks state during typecheckdef; 2 == loop detected
+	Typecheck uint8 // tracks state during typechecking; 2 == loop detected
 	Local     bool
-	Dodata    uint8
+	IsStatic  bool // whether this Node will be converted to purely static data
 	Initorder uint8
-	Used      bool
+	Used      bool // for variable/label declared and not used error
 	Isddd     bool // is the argument variadic
 	Implicit  bool
 	Addrtaken bool  // address taken, even if not moved to heap
@@ -77,9 +77,9 @@ type Node struct {
 
 const (
 	hasBreak = 1 << iota
-	notLiveAtEnd
 	isClosureVar
 	isOutputParamHeapAddr
+	noInline // used internally by inliner to indicate that a function call should not be inlined; set for OCALLFUNC and OCALLMETH only
 )
 
 func (n *Node) HasBreak() bool {
@@ -92,16 +92,6 @@ func (n *Node) SetHasBreak(b bool) {
 		n.flags &^= hasBreak
 	}
 }
-func (n *Node) NotLiveAtEnd() bool {
-	return n.flags&notLiveAtEnd != 0
-}
-func (n *Node) SetNotLiveAtEnd(b bool) {
-	if b {
-		n.flags |= notLiveAtEnd
-	} else {
-		n.flags &^= notLiveAtEnd
-	}
-}
 func (n *Node) isClosureVar() bool {
 	return n.flags&isClosureVar != 0
 }
@@ -110,6 +100,16 @@ func (n *Node) setIsClosureVar(b bool) {
 		n.flags |= isClosureVar
 	} else {
 		n.flags &^= isClosureVar
+	}
+}
+func (n *Node) noInline() bool {
+	return n.flags&noInline != 0
+}
+func (n *Node) setNoInline(b bool) {
+	if b {
+		n.flags |= noInline
+	} else {
+		n.flags &^= noInline
 	}
 }
 
@@ -290,6 +290,8 @@ type Func struct {
 	InlCost int32
 	Depth   int32
 
+	Label int32 // largest auto-generated label in this function
+
 	Endlineno int32
 	WBLineno  int32 // line number of first write barrier
 
@@ -349,7 +351,8 @@ const (
 	OCOMPLIT         // Right{List} (composite literal, not yet lowered to specific form)
 	OMAPLIT          // Type{List} (composite literal, Type is map)
 	OSTRUCTLIT       // Type{List} (composite literal, Type is struct)
-	OARRAYLIT        // Type{List} (composite literal, Type is array or slice)
+	OARRAYLIT        // Type{List} (composite literal, Type is array)
+	OSLICELIT        // Type{List} (composite literal, Type is slice)
 	OPTRLIT          // &Left (left is composite literal)
 	OCONV            // Type(Left) (type conversion)
 	OCONVIFACE       // Type(Left) (type conversion, to interface)
@@ -381,7 +384,7 @@ const (
 	OINDEX     // Left[Right] (index of array or slice)
 	OINDEXMAP  // Left[Right] (index of map)
 	OKEY       // Left:Right (key:value in struct/array/map literal, or slice index pair)
-	_          // was OPARAM, but cannot remove without breaking binary blob in builtin.go
+	OIDATA     // data word of an interface value in Left; TODO: move next to OITAB once it is easier to regenerate the binary blob in builtin.go (issues 15835, 15839)
 	OLEN       // len(Left)
 	OMAKE      // make(List) (before type checking converts to one of the following)
 	OMAKECHAN  // make(Type, Left) (type is chan)
@@ -423,7 +426,7 @@ const (
 	// statements
 	OBLOCK    // { List } (block of code)
 	OBREAK    // break
-	OCASE     // case List: Nbody (select case after processing; List==nil means default)
+	OCASE     // case Left or List[0]..List[1]: Nbody (select case after processing; Left==nil and List==nil means default)
 	OXCASE    // case List: Nbody (select case before processing; List==nil means default)
 	OCONTINUE // continue
 	ODEFER    // defer Left (Left must be call)
@@ -543,6 +546,11 @@ func (n *Nodes) Set1(node *Node) {
 	n.slice = &[]*Node{node}
 }
 
+// Set2 sets n to a slice containing two nodes.
+func (n *Nodes) Set2(n1, n2 *Node) {
+	n.slice = &[]*Node{n1, n2}
+}
+
 // MoveNodes sets n to the contents of n2, then clears n2.
 func (n *Nodes) MoveNodes(n2 *Nodes) {
 	n.slice = n2.slice
@@ -564,12 +572,26 @@ func (n Nodes) Addr(i int) **Node {
 // Append appends entries to Nodes.
 // If a slice is passed in, this will take ownership of it.
 func (n *Nodes) Append(a ...*Node) {
+	if len(a) == 0 {
+		return
+	}
 	if n.slice == nil {
-		if len(a) > 0 {
-			n.slice = &a
-		}
+		n.slice = &a
 	} else {
 		*n.slice = append(*n.slice, a...)
+	}
+}
+
+// Prepend prepends entries to Nodes.
+// If a slice is passed in, this will take ownership of it.
+func (n *Nodes) Prepend(a ...*Node) {
+	if len(a) == 0 {
+		return
+	}
+	if n.slice == nil {
+		n.slice = &a
+	} else {
+		*n.slice = append(a, *n.slice...)
 	}
 }
 

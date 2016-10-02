@@ -42,8 +42,11 @@ func TestCgoTraceback(t *testing.T) {
 }
 
 func TestCgoCallbackGC(t *testing.T) {
-	if runtime.GOOS == "plan9" || runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "plan9", "windows":
 		t.Skipf("no pthreads on %s", runtime.GOOS)
+	case "freebsd":
+		testenv.SkipFlaky(t, 16396)
 	}
 	if testing.Short() {
 		switch {
@@ -252,7 +255,7 @@ func testCgoPprof(t *testing.T, buildArg, runArg string) {
 	fn := strings.TrimSpace(string(got))
 	defer os.Remove(fn)
 
-	cmd := testEnv(exec.Command("go", "tool", "pprof", "-top", "-nodecount=1", exe, fn))
+	cmd := testEnv(exec.Command(testenv.GoToolPath(t), "tool", "pprof", "-top", "-nodecount=1", exe, fn))
 
 	found := false
 	for i, e := range cmd.Env {
@@ -287,4 +290,32 @@ func TestCgoPprofPIE(t *testing.T) {
 
 func TestCgoPprofThread(t *testing.T) {
 	testCgoPprof(t, "", "CgoPprofThread")
+}
+
+func TestRaceProf(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("not yet supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+
+	testenv.MustHaveGoRun(t)
+
+	// This test requires building various packages with -race, so
+	// it's somewhat slow.
+	if testing.Short() {
+		t.Skip("skipping test in -short mode")
+	}
+
+	exe, err := buildTestProg(t, "testprogcgo", "-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := testEnv(exec.Command(exe, "CgoRaceprof")).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "OK\n"
+	if string(got) != want {
+		t.Errorf("expected %q got %s", want, got)
+	}
 }

@@ -212,7 +212,7 @@ TEXT runtime·nanotime(SB),NOSPLIT,$24-8
 	RET
 
 TEXT runtime·rtsigprocmask(SB),NOSPLIT,$-8-28
-	MOVW	sig+0(FP), R0
+	MOVW	how+0(FP), R0
 	MOVD	new+8(FP), R1
 	MOVD	old+16(FP), R2
 	MOVW	size+24(FP), R3
@@ -319,8 +319,8 @@ TEXT runtime·clone(SB),NOSPLIT,$-8
 	MOVD	stk+8(FP), R1
 
 	// Copy mp, gp, fn off parent stack for use by child.
-	MOVD	mm+16(FP), R10
-	MOVD	gg+24(FP), R11
+	MOVD	mp+16(FP), R10
+	MOVD	gp+24(FP), R11
 	MOVD	fn+32(FP), R12
 
 	MOVD	R10, -8(R1)

@@ -15,11 +15,6 @@ import (
 	"unsafe"
 )
 
-// File represents an open file descriptor.
-type File struct {
-	*file
-}
-
 // file is the real representation of *File.
 // The extra level of indirection ensures that no clients of os
 // can overwrite this data, which could cause the finalizer
@@ -196,65 +191,6 @@ func (file *file) close() error {
 	return err
 }
 
-func (file *File) readdir(n int) (fi []FileInfo, err error) {
-	if file == nil {
-		return nil, syscall.EINVAL
-	}
-	if !file.isdir() {
-		return nil, &PathError{"Readdir", file.name, syscall.ENOTDIR}
-	}
-	if !file.dirinfo.isempty && file.fd == syscall.InvalidHandle {
-		return nil, syscall.EINVAL
-	}
-	wantAll := n <= 0
-	size := n
-	if wantAll {
-		n = -1
-		size = 100
-	}
-	fi = make([]FileInfo, 0, size) // Empty with room to grow.
-	d := &file.dirinfo.data
-	for n != 0 && !file.dirinfo.isempty {
-		if file.dirinfo.needdata {
-			e := syscall.FindNextFile(file.fd, d)
-			if e != nil {
-				if e == syscall.ERROR_NO_MORE_FILES {
-					break
-				} else {
-					err = &PathError{"FindNextFile", file.name, e}
-					if !wantAll {
-						fi = nil
-					}
-					return
-				}
-			}
-		}
-		file.dirinfo.needdata = true
-		name := syscall.UTF16ToString(d.FileName[0:])
-		if name == "." || name == ".." { // Useless names
-			continue
-		}
-		f := &fileStat{
-			name: name,
-			sys: syscall.Win32FileAttributeData{
-				FileAttributes: d.FileAttributes,
-				CreationTime:   d.CreationTime,
-				LastAccessTime: d.LastAccessTime,
-				LastWriteTime:  d.LastWriteTime,
-				FileSizeHigh:   d.FileSizeHigh,
-				FileSizeLow:    d.FileSizeLow,
-			},
-			path: file.dirinfo.path + `\` + name,
-		}
-		n--
-		fi = append(fi, f)
-	}
-	if !wantAll && len(fi) == 0 {
-		return fi, io.EOF
-	}
-	return fi, nil
-}
-
 // readConsole reads utf16 characters from console File,
 // encodes them into utf8 and stores them in buffer b.
 // It returns the number of utf8 bytes read and an error, if any.
@@ -281,14 +217,16 @@ func (f *File) readConsole(b []byte) (n int, err error) {
 			if len(b) > 0 {
 				pmb = &mbytes[0]
 			}
-			acp := windows.GetACP()
-			nwc, err := windows.MultiByteToWideChar(acp, 2, pmb, int32(nmb), nil, 0)
+			ccp := windows.GetConsoleCP()
+			// Convert from 8-bit console encoding to UTF16.
+			// MultiByteToWideChar defaults to Unicode NFC form, which is the expected one.
+			nwc, err := windows.MultiByteToWideChar(ccp, 0, pmb, int32(nmb), nil, 0)
 			if err != nil {
 				return 0, err
 			}
 			wchars := make([]uint16, nwc)
 			pwc := &wchars[0]
-			nwc, err = windows.MultiByteToWideChar(acp, 2, pmb, int32(nmb), pwc, nwc)
+			nwc, err = windows.MultiByteToWideChar(ccp, 0, pmb, int32(nmb), pwc, nwc)
 			if err != nil {
 				return 0, err
 			}
@@ -585,43 +523,4 @@ func Symlink(oldname, newname string) error {
 		return &LinkError{"symlink", oldname, newname, err}
 	}
 	return nil
-}
-
-func fromSlash(path string) string {
-	// Replace each '/' with '\\' if present
-	var pathbuf []byte
-	var lastSlash int
-	for i, b := range path {
-		if b == '/' {
-			if pathbuf == nil {
-				pathbuf = make([]byte, len(path))
-			}
-			copy(pathbuf[lastSlash:], path[lastSlash:i])
-			pathbuf[i] = '\\'
-			lastSlash = i + 1
-		}
-	}
-	if pathbuf == nil {
-		return path
-	}
-
-	copy(pathbuf[lastSlash:], path[lastSlash:])
-	return string(pathbuf)
-}
-
-func dirname(path string) string {
-	vol := volumeName(path)
-	i := len(path) - 1
-	for i >= len(vol) && !IsPathSeparator(path[i]) {
-		i--
-	}
-	dir := path[len(vol) : i+1]
-	last := len(dir) - 1
-	if last > 0 && IsPathSeparator(dir[last]) {
-		dir = dir[:last]
-	}
-	if dir == "" {
-		dir = "."
-	}
-	return vol + dir
 }

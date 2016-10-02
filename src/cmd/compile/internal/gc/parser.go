@@ -15,19 +15,27 @@ package gc
 import (
 	"bufio"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
 
 const trace = false // if set, parse tracing can be enabled with -x
 
-// parse_import parses the export data of a package that is imported.
-func parse_import(bin *bufio.Reader, indent []byte) {
-	newparser(bin, indent).import_package()
-}
+// oldParseFile parses a single Go source file.
+func oldParseFile(infile string) {
+	f, err := os.Open(infile)
+	if err != nil {
+		fmt.Printf("open %s: %v\n", infile, err)
+		errorexit()
+	}
+	defer f.Close()
+	bin := bufio.NewReader(f)
 
-// parse_file parses a single Go source file.
-func parse_file(bin *bufio.Reader) {
+	// Skip initial BOM if present.
+	if r, _, _ := bin.ReadRune(); r != BOM {
+		bin.UnreadRune()
+	}
 	newparser(bin, nil).file()
 }
 
@@ -36,9 +44,6 @@ type parser struct {
 	fnest  int    // function nesting level (for error handling)
 	xnest  int    // expression nesting level (for complit ambiguity resolution)
 	indent []byte // tracing support
-
-	// TODO(gri) remove this once we switch to binary export format
-	structpkg *Pkg // for verification in addmethod only
 }
 
 // newparser returns a new parser ready to parse from src.
@@ -88,7 +93,7 @@ func (p *parser) syntax_error(msg string) {
 		msg = ", " + msg
 	default:
 		// plain error - we don't care about current token
-		Yyerror("syntax error: %s", msg)
+		yyerror("syntax error: %s", msg)
 		return
 	}
 
@@ -116,7 +121,7 @@ func (p *parser) syntax_error(msg string) {
 		tok = tokstring(p.tok)
 	}
 
-	Yyerror("syntax error: unexpected %s", tok+msg)
+	yyerror("syntax error: unexpected %s", tok+msg)
 }
 
 // Like syntax_error, but reports error at given line rather than current lexer line.
@@ -317,13 +322,13 @@ func (p *parser) importdcl() {
 
 	var my *Sym
 	switch p.tok {
-	case LNAME, '@', '?':
+	case LNAME:
 		// import with given name
 		my = p.sym()
 
 	case '.':
 		// import into my name space
-		my = Lookup(".")
+		my = lookup(".")
 		p.next()
 	}
 
@@ -353,10 +358,10 @@ func (p *parser) importdcl() {
 	ipkg.Direct = true
 
 	if my == nil {
-		my = Lookup(ipkg.Name)
+		my = lookup(ipkg.Name)
 	}
 
-	pack := Nod(OPACK, nil, nil)
+	pack := nod(OPACK, nil, nil)
 	pack.Sym = my
 	pack.Name.Pkg = ipkg
 	pack.Lineno = line
@@ -367,7 +372,7 @@ func (p *parser) importdcl() {
 	}
 	if my.Name == "init" {
 		lineno = line
-		Yyerror("cannot import package as init - init must be a func")
+		yyerror("cannot import package as init - init must be a func")
 		return
 	}
 	if my.Name == "_" {
@@ -380,49 +385,6 @@ func (p *parser) importdcl() {
 	my.Def = pack
 	my.Lastlineno = line
 	my.Block = 1 // at top level
-}
-
-// import_package parses the header of an imported package as exported
-// in textual format from another package.
-func (p *parser) import_package() {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("import_package")()
-	}
-
-	p.want(LPACKAGE)
-	var name string
-	if p.tok == LNAME {
-		name = p.sym_.Name
-		p.next()
-	} else {
-		p.import_error()
-	}
-
-	// read but skip "safe" bit (see issue #15772)
-	if p.tok == LNAME {
-		p.next()
-	}
-	p.want(';')
-
-	if importpkg.Name == "" {
-		importpkg.Name = name
-		numImport[name]++
-	} else if importpkg.Name != name {
-		Yyerror("conflicting names %s and %s for package %q", importpkg.Name, name, importpkg.Path)
-	}
-
-	typecheckok = true
-	defercheckwidth()
-
-	p.hidden_import_list()
-	p.want('$')
-	// don't read past 2nd '$'
-	if p.tok != '$' {
-		p.import_error()
-	}
-
-	resumecheckwidth()
-	typecheckok = false
 }
 
 // Declaration = ConstDecl | TypeDecl | VarDecl .
@@ -538,7 +500,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 
 	if rangeOk && p.got(LRANGE) {
 		// LRANGE expr
-		r := Nod(ORANGE, nil, p.expr())
+		r := nod(ORANGE, nil, p.expr())
 		r.Etype = 0 // := flag
 		return r
 	}
@@ -555,7 +517,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 			p.next()
 			rhs := p.expr()
 
-			stmt := Nod(OASOP, lhs, rhs)
+			stmt := nod(OASOP, lhs, rhs)
 			stmt.Etype = EType(op) // rathole to pass opcode
 			return stmt
 
@@ -563,7 +525,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 			// expr LINCOP
 			p.next()
 
-			stmt := Nod(OASOP, lhs, Nodintconst(1))
+			stmt := nod(OASOP, lhs, nodintconst(1))
 			stmt.Implicit = true
 			stmt.Etype = EType(p.op)
 			return stmt
@@ -585,7 +547,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 					p.syntax_error("expecting semicolon or newline or }")
 					// we already progressed, no need to advance
 				}
-				lhs := Nod(OLABEL, lhs, nil)
+				lhs := nod(OLABEL, lhs, nil)
 				lhs.Sym = dclstack // context, for goto restrictions
 				p.next()           // consume ':' after making label node for correct lineno
 				return p.labeled_stmt(lhs)
@@ -607,7 +569,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 		p.next()
 		if rangeOk && p.got(LRANGE) {
 			// expr_list '=' LRANGE expr
-			r := Nod(ORANGE, nil, p.expr())
+			r := nod(ORANGE, nil, p.expr())
 			r.List.Set(lhs)
 			r.Etype = 0 // := flag
 			return r
@@ -618,10 +580,10 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 
 		if len(lhs) == 1 && len(rhs) == 1 {
 			// simple
-			return Nod(OAS, lhs[0], rhs[0])
+			return nod(OAS, lhs[0], rhs[0])
 		}
 		// multiple
-		stmt := Nod(OAS2, nil, nil)
+		stmt := nod(OAS2, nil, nil)
 		stmt.List.Set(lhs)
 		stmt.Rlist.Set(rhs)
 		return stmt
@@ -632,7 +594,7 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 
 		if rangeOk && p.got(LRANGE) {
 			// expr_list LCOLAS LRANGE expr
-			r := Nod(ORANGE, nil, p.expr())
+			r := nod(ORANGE, nil, p.expr())
 			r.List.Set(lhs)
 			r.Colas = true
 			colasdefn(lhs, r)
@@ -643,14 +605,14 @@ func (p *parser) simple_stmt(labelOk, rangeOk bool) *Node {
 		rhs := p.expr_list()
 
 		if rhs[0].Op == OTYPESW {
-			ts := Nod(OTYPESW, nil, rhs[0].Right)
+			ts := nod(OTYPESW, nil, rhs[0].Right)
 			if len(rhs) > 1 {
-				Yyerror("expr.(type) must be alone in list")
+				yyerror("expr.(type) must be alone in list")
 			}
 			if len(lhs) > 1 {
-				Yyerror("argument count mismatch: %d = %d", len(lhs), 1)
+				yyerror("argument count mismatch: %d = %d", len(lhs), 1)
 			} else if (lhs[0].Op != ONAME && lhs[0].Op != OTYPE && lhs[0].Op != ONONAME && (lhs[0].Op != OLITERAL || lhs[0].Name == nil)) || isblank(lhs[0]) {
-				Yyerror("invalid variable name %s in type switch", lhs[0])
+				yyerror("invalid variable name %v in type switch", lhs[0])
 			} else {
 				ts.Left = dclname(lhs[0].Sym)
 			} // it's a colas, so must not re-use an oldname
@@ -721,7 +683,7 @@ func (p *parser) case_(tswitch *Node) *Node {
 			// right will point to next case
 			// done in casebody()
 			markdcl() // matching popdcl in caseblock
-			stmt := Nod(OXCASE, nil, nil)
+			stmt := nod(OXCASE, nil, nil)
 			stmt.List.Set(cases)
 			if tswitch != nil {
 				if n := tswitch.Left; n != nil {
@@ -747,12 +709,12 @@ func (p *parser) case_(tswitch *Node) *Node {
 			// right will point to next case
 			// done in casebody()
 			markdcl() // matching popdcl in caseblock
-			stmt := Nod(OXCASE, nil, nil)
+			stmt := nod(OXCASE, nil, nil)
 			var n *Node
 			if len(cases) == 1 {
-				n = Nod(OAS, cases[0], rhs)
+				n = nod(OAS, cases[0], rhs)
 			} else {
-				n = Nod(OAS2, nil, nil)
+				n = nod(OAS2, nil, nil)
 				n.List.Set(cases)
 				n.Rlist.Set1(rhs)
 			}
@@ -771,7 +733,7 @@ func (p *parser) case_(tswitch *Node) *Node {
 			// right will point to next case
 			// done in casebody()
 			markdcl() // matching popdcl in caseblock
-			stmt := Nod(OXCASE, nil, nil)
+			stmt := nod(OXCASE, nil, nil)
 			stmt.List.Set1(colas(cases, []*Node{rhs}, lno))
 
 			p.want(':') // consume ':' after declaring select cases for correct lineno
@@ -779,7 +741,7 @@ func (p *parser) case_(tswitch *Node) *Node {
 
 		default:
 			markdcl()                     // for matching popdcl in caseblock
-			stmt := Nod(OXCASE, nil, nil) // don't return nil
+			stmt := nod(OXCASE, nil, nil) // don't return nil
 			p.syntax_error("expecting := or = or : or comma")
 			p.advance(LCASE, LDEFAULT, '}')
 			return stmt
@@ -790,7 +752,7 @@ func (p *parser) case_(tswitch *Node) *Node {
 		p.next()
 
 		markdcl() // matching popdcl in caseblock
-		stmt := Nod(OXCASE, nil, nil)
+		stmt := nod(OXCASE, nil, nil)
 		if tswitch != nil {
 			if n := tswitch.Left; n != nil {
 				// type switch - declare variable
@@ -808,7 +770,7 @@ func (p *parser) case_(tswitch *Node) *Node {
 
 	default:
 		markdcl()                     // matching popdcl in caseblock
-		stmt := Nod(OXCASE, nil, nil) // don't return nil
+		stmt := nod(OXCASE, nil, nil) // don't return nil
 		p.syntax_error("expecting case or default or }")
 		p.advance(LCASE, LDEFAULT, '}')
 		return stmt
@@ -829,7 +791,7 @@ func (p *parser) compound_stmt() *Node {
 	popdcl()
 
 	if len(l) == 0 {
-		return Nod(OEMPTY, nil, nil)
+		return nod(OEMPTY, nil, nil)
 	}
 	return liststmt(l)
 }
@@ -904,9 +866,9 @@ func (p *parser) for_header() *Node {
 	if init != nil || post != nil {
 		// init ; test ; incr
 		if post != nil && post.Colas {
-			Yyerror("cannot declare in the for-increment")
+			yyerror("cannot declare in the for-increment")
 		}
-		h := Nod(OFOR, nil, nil)
+		h := nod(OFOR, nil, nil)
 		if init != nil {
 			h.Ninit.Set1(init)
 		}
@@ -921,7 +883,7 @@ func (p *parser) for_header() *Node {
 	}
 
 	// normal test
-	h := Nod(OFOR, nil, nil)
+	h := nod(OFOR, nil, nil)
 	h.Left = cond
 	return h
 }
@@ -970,7 +932,7 @@ func (p *parser) header(for_stmt bool) (init, cond, post *Node) {
 		// accept potential vardcl but complain
 		// (for test/syntax/forvar.go)
 		if for_stmt && p.tok == LVAR {
-			Yyerror("var declaration not allowed in for initializer")
+			yyerror("var declaration not allowed in for initializer")
 			p.next()
 		}
 		init = p.simple_stmt(false, for_stmt)
@@ -1010,7 +972,7 @@ func (p *parser) if_header() *Node {
 	}
 
 	init, cond, _ := p.header(false)
-	h := Nod(OIF, nil, nil)
+	h := nod(OIF, nil, nil)
 	if init != nil {
 		h.Ninit.Set1(init)
 	}
@@ -1030,7 +992,7 @@ func (p *parser) if_stmt() *Node {
 
 	stmt := p.if_header()
 	if stmt.Left == nil {
-		Yyerror("missing condition in if statement")
+		yyerror("missing condition in if statement")
 	}
 
 	stmt.Nbody.Set(p.loop_body("if clause"))
@@ -1090,7 +1052,7 @@ func (p *parser) select_stmt() *Node {
 	}
 
 	p.want(LSELECT)
-	hdr := Nod(OSELECT, nil, nil)
+	hdr := nod(OSELECT, nil, nil)
 	hdr.List.Set(p.caseblock_list(nil))
 	return hdr
 }
@@ -1106,7 +1068,7 @@ func (p *parser) bexpr(prec OpPrec) *Node {
 	for p.prec > prec {
 		op, prec1 := p.op, p.prec
 		p.next()
-		x = Nod(op, x, p.bexpr(prec1))
+		x = nod(op, x, p.bexpr(prec1))
 	}
 	return x
 }
@@ -1144,10 +1106,10 @@ func (p *parser) uexpr() *Node {
 		x := unparen(p.uexpr())
 		if x.Op == OCOMPLIT {
 			// Special case for &T{...}: turn into (*T){...}.
-			x.Right = Nod(OIND, x.Right, nil)
+			x.Right = nod(OIND, x.Right, nil)
 			x.Right.Implicit = true
 		} else {
-			x = Nod(OADDR, x, nil)
+			x = nod(OADDR, x, nil)
 		}
 		return x
 
@@ -1208,7 +1170,7 @@ func (p *parser) uexpr() *Node {
 		}
 
 		// x is not a channel type => we have a receive op
-		return Nod(ORECV, x, nil)
+		return nod(ORECV, x, nil)
 
 	default:
 		return p.pexpr(false)
@@ -1216,7 +1178,7 @@ func (p *parser) uexpr() *Node {
 
 	// simple uexpr
 	p.next()
-	return Nod(op, p.uexpr(), nil)
+	return nod(op, p.uexpr(), nil)
 }
 
 // pseudocall parses call-like statements that can be preceded by 'defer' and 'go'.
@@ -1230,10 +1192,10 @@ func (p *parser) pseudocall() *Node {
 	case OCALL:
 		return x
 	case OPAREN:
-		Yyerror("expression in go/defer must not be parenthesized")
+		yyerror("expression in go/defer must not be parenthesized")
 		// already progressed, no need to advance
 	default:
-		Yyerror("expression in go/defer must be function call")
+		yyerror("expression in go/defer must be function call")
 		// already progressed, no need to advance
 	}
 	return nil
@@ -1254,7 +1216,7 @@ func (p *parser) operand(keep_parens bool) *Node {
 		p.next()
 		return x
 
-	case LNAME, '@', '?':
+	case LNAME:
 		return p.name()
 
 	case '(':
@@ -1286,7 +1248,7 @@ func (p *parser) operand(keep_parens bool) *Node {
 		// in a go/defer statement. In that case, operand is called
 		// with keep_parens set.
 		if keep_parens {
-			x = Nod(OPAREN, x, nil)
+			x = nod(OPAREN, x, nil)
 		}
 		return x
 
@@ -1357,7 +1319,7 @@ loop:
 		case '.':
 			p.next()
 			switch p.tok {
-			case LNAME, '@', '?':
+			case LNAME:
 				// pexpr '.' sym
 				x = p.new_dotname(x)
 
@@ -1368,13 +1330,13 @@ loop:
 					// pexpr '.' '(' expr_or_type ')'
 					t := p.expr() // expr_or_type
 					p.want(')')
-					x = Nod(ODOTTYPE, x, t)
+					x = nod(ODOTTYPE, x, t)
 
 				case LTYPE:
 					// pexpr '.' '(' LTYPE ')'
 					p.next()
 					p.want(')')
-					x = Nod(OTYPESW, nil, x)
+					x = nod(OTYPESW, nil, x)
 				}
 
 			default:
@@ -1403,20 +1365,20 @@ loop:
 			case 0:
 				i := index[0]
 				if i == nil {
-					Yyerror("missing index in index expression")
+					yyerror("missing index in index expression")
 				}
-				x = Nod(OINDEX, x, i)
+				x = nod(OINDEX, x, i)
 			case 1:
-				x = Nod(OSLICE, x, nil)
+				x = nod(OSLICE, x, nil)
 				x.SetSliceBounds(index[0], index[1], nil)
 			case 2:
 				if index[1] == nil {
-					Yyerror("middle index required in 3-index slice")
+					yyerror("middle index required in 3-index slice")
 				}
 				if index[2] == nil {
-					Yyerror("final index required in 3-index slice")
+					yyerror("final index required in 3-index slice")
 				}
-				x = Nod(OSLICE3, x, nil)
+				x = nod(OSLICE3, x, nil)
 				x.SetSliceBounds(index[0], index[1], index[2])
 
 			default:
@@ -1428,7 +1390,7 @@ loop:
 			args, ddd := p.arg_list()
 
 			// call or conversion
-			x = Nod(OCALL, x, nil)
+			x = nod(OCALL, x, nil)
 			x.List.Set(args)
 			x.Isddd = ddd
 
@@ -1482,7 +1444,7 @@ func (p *parser) keyval() *Node {
 
 	if p.got(':') {
 		// key ':' value
-		return Nod(OKEY, x, wrapname(p.bare_complitexpr()))
+		return nod(OKEY, x, wrapname(p.bare_complitexpr()))
 	}
 
 	// value
@@ -1494,7 +1456,7 @@ func wrapname(x *Node) *Node {
 	// Introduce a wrapper node to give the correct line.
 	switch x.Op {
 	case ONAME, ONONAME, OTYPE, OPACK, OLITERAL:
-		x = Nod(OPAREN, x, nil)
+		x = nod(OPAREN, x, nil)
 		x.Implicit = true
 	}
 	return x
@@ -1521,7 +1483,7 @@ func (p *parser) complitexpr() *Node {
 	}
 
 	// make node early so we get the right line number
-	n := Nod(OCOMPLIT, nil, nil)
+	n := nod(OCOMPLIT, nil, nil)
 
 	p.want('{')
 	p.xnest++
@@ -1574,36 +1536,22 @@ func (p *parser) onew_name() *Node {
 		defer p.trace("onew_name")()
 	}
 
-	switch p.tok {
-	case LNAME, '@', '?':
+	if p.tok == LNAME {
 		return p.new_name(p.sym())
 	}
 	return nil
 }
 
 func (p *parser) sym() *Sym {
-	switch p.tok {
-	case LNAME:
+	if p.tok == LNAME {
 		s := p.sym_ // from localpkg
 		p.next()
-		// during imports, unqualified non-exported identifiers are from builtinpkg
-		if importpkg != nil && !exportname(s.Name) {
-			s = Pkglookup(s.Name, builtinpkg)
-		}
 		return s
-
-	case '@':
-		return p.hidden_importsym()
-
-	case '?':
-		p.next()
-		return nil
-
-	default:
-		p.syntax_error("expecting name")
-		p.advance()
-		return new(Sym)
 	}
+
+	p.syntax_error("expecting name")
+	p.advance()
+	return new(Sym)
 }
 
 func mkname(sym *Sym) *Node {
@@ -1630,11 +1578,11 @@ func (p *parser) dotdotdot() *Node {
 
 	p.want(LDDD)
 	if typ := p.try_ntype(); typ != nil {
-		return Nod(ODDD, typ, nil)
+		return nod(ODDD, typ, nil)
 	}
 
-	Yyerror("final argument in variadic function missing type")
-	return Nod(ODDD, typenod(typ(TINTER)), nil)
+	yyerror("final argument in variadic function missing type")
+	return nod(ODDD, typenod(typ(TINTER)), nil)
 }
 
 func (p *parser) ntype() *Node {
@@ -1665,10 +1613,10 @@ func (p *parser) signature(recv *Node) *Node {
 	if p.tok == '(' {
 		result = p.param_list(false)
 	} else if t := p.try_ntype(); t != nil {
-		result = []*Node{Nod(ODCLFIELD, nil, t)}
+		result = []*Node{nod(ODCLFIELD, nil, t)}
 	}
 
-	typ := Nod(OTFUNC, recv, nil)
+	typ := nod(OTFUNC, recv, nil)
 	typ.List.Set(params)
 	typ.Rlist.Set(result)
 
@@ -1692,7 +1640,7 @@ func (p *parser) try_ntype() *Node {
 		// recvchantype
 		p.next()
 		p.want(LCHAN)
-		t := Nod(OTCHAN, p.chan_elem(), nil)
+		t := nod(OTCHAN, p.chan_elem(), nil)
 		t.Etype = EType(Crecv)
 		return t
 
@@ -1709,14 +1657,14 @@ func (p *parser) try_ntype() *Node {
 		var len *Node
 		if p.tok != ']' {
 			if p.got(LDDD) {
-				len = Nod(ODDD, nil, nil)
+				len = nod(ODDD, nil, nil)
 			} else {
 				len = p.expr()
 			}
 		}
 		p.xnest--
 		p.want(']')
-		return Nod(OTARRAY, len, p.ntype())
+		return nod(OTARRAY, len, p.ntype())
 
 	case LCHAN:
 		// LCHAN non_recvchantype
@@ -1726,7 +1674,7 @@ func (p *parser) try_ntype() *Node {
 		if p.got(LCOMM) {
 			dir = EType(Csend)
 		}
-		t := Nod(OTCHAN, p.chan_elem(), nil)
+		t := nod(OTCHAN, p.chan_elem(), nil)
 		t.Etype = dir
 		return t
 
@@ -1737,7 +1685,7 @@ func (p *parser) try_ntype() *Node {
 		key := p.ntype()
 		p.want(']')
 		val := p.ntype()
-		return Nod(OTMAP, key, val)
+		return nod(OTMAP, key, val)
 
 	case LSTRUCT:
 		return p.structtype()
@@ -1748,9 +1696,9 @@ func (p *parser) try_ntype() *Node {
 	case '*':
 		// ptrtype
 		p.next()
-		return Nod(OIND, p.ntype(), nil)
+		return nod(OIND, p.ntype(), nil)
 
-	case LNAME, '@', '?':
+	case LNAME:
 		return p.dotname()
 
 	case '(':
@@ -1789,7 +1737,7 @@ func (p *parser) new_dotname(obj *Node) *Node {
 		obj.Used = true
 		return oldname(s)
 	}
-	return NodSym(OXDOT, obj, sel)
+	return nodSym(OXDOT, obj, sel)
 }
 
 func (p *parser) dotname() *Node {
@@ -1821,7 +1769,7 @@ func (p *parser) structtype() *Node {
 	}
 	p.want('}')
 
-	t := Nod(OTSTRUCT, nil, nil)
+	t := nod(OTSTRUCT, nil, nil)
 	t.List.Set(l)
 	return t
 }
@@ -1843,7 +1791,7 @@ func (p *parser) interfacetype() *Node {
 	}
 	p.want('}')
 
-	t := Nod(OTINTER, nil, nil)
+	t := nod(OTINTER, nil, nil)
 	t.List.Set(l)
 	return t
 }
@@ -1867,7 +1815,7 @@ func (p *parser) xfndcl() *Node {
 	f.Nbody.Set(body)
 	f.Noescape = p.pragma&Noescape != 0
 	if f.Noescape && len(body) != 0 {
-		Yyerror("can only use //go:noescape with external func implementations")
+		yyerror("can only use //go:noescape with external func implementations")
 	}
 	f.Func.Pragma = p.pragma
 	f.Func.Endlineno = lineno
@@ -1888,7 +1836,7 @@ func (p *parser) fndcl() *Node {
 	}
 
 	switch p.tok {
-	case LNAME, '@', '?':
+	case LNAME:
 		// FunctionName Signature
 		name := p.sym()
 		t := p.signature(nil)
@@ -1896,17 +1844,17 @@ func (p *parser) fndcl() *Node {
 		if name.Name == "init" {
 			name = renameinit()
 			if t.List.Len() > 0 || t.Rlist.Len() > 0 {
-				Yyerror("func init must have no arguments and no return values")
+				yyerror("func init must have no arguments and no return values")
 			}
 		}
 
 		if localpkg.Name == "main" && name.Name == "main" {
 			if t.List.Len() > 0 || t.Rlist.Len() > 0 {
-				Yyerror("func main must have no arguments and no return values")
+				yyerror("func main must have no arguments and no return values")
 			}
 		}
 
-		f := Nod(ODCLFUNC, nil, nil)
+		f := nod(ODCLFUNC, nil, nil)
 		f.Func.Nname = newfuncname(name)
 		f.Func.Nname.Name.Defn = f
 		f.Func.Nname.Name.Param.Ntype = t // TODO: check if nname already has an ntype
@@ -1927,23 +1875,23 @@ func (p *parser) fndcl() *Node {
 
 		// check after parsing header for fault-tolerance
 		if recv == nil {
-			Yyerror("method has no receiver")
+			yyerror("method has no receiver")
 			return nil
 		}
 
 		if len(rparam) > 1 {
-			Yyerror("method has multiple receivers")
+			yyerror("method has multiple receivers")
 			return nil
 		}
 
 		if recv.Op != ODCLFIELD {
-			Yyerror("bad receiver in method")
+			yyerror("bad receiver in method")
 			return nil
 		}
 
-		f := Nod(ODCLFUNC, nil, nil)
+		f := nod(ODCLFUNC, nil, nil)
 		f.Func.Shortname = newfuncname(name)
-		f.Func.Nname = methodname1(f.Func.Shortname, recv.Right)
+		f.Func.Nname = methodname(f.Func.Shortname, recv.Right)
 		f.Func.Nname.Name.Defn = f
 		f.Func.Nname.Name.Param.Ntype = t
 		declare(f.Func.Nname, PFUNC)
@@ -1955,67 +1903,6 @@ func (p *parser) fndcl() *Node {
 		p.syntax_error("expecting name or (")
 		p.advance('{', ';')
 		return nil
-	}
-}
-
-func (p *parser) hidden_fndcl() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_fndcl")()
-	}
-
-	switch p.tok {
-	default:
-		// hidden_pkg_importsym '(' ohidden_funarg_list ')' ohidden_funres
-		s1 := p.hidden_pkg_importsym()
-		p.want('(')
-		s3 := p.ohidden_funarg_list()
-		p.want(')')
-		s5 := p.ohidden_funres()
-
-		s := s1
-		t := functype(nil, s3, s5)
-
-		importsym(s, ONAME)
-		if s.Def != nil && s.Def.Op == ONAME {
-			if Eqtype(t, s.Def.Type) {
-				dclcontext = PDISCARD // since we skip funchdr below
-				return nil
-			}
-			Yyerror("inconsistent definition for func %v during import\n\t%v\n\t%v", s, s.Def.Type, t)
-		}
-
-		ss := newfuncname(s)
-		ss.Type = t
-		declare(ss, PFUNC)
-
-		funchdr(ss)
-		return ss
-
-	case '(':
-		// '(' hidden_funarg_list ')' sym '(' ohidden_funarg_list ')' ohidden_funres
-		p.next()
-		s2 := p.hidden_funarg_list()
-		p.want(')')
-		s4 := p.sym()
-		p.want('(')
-		s6 := p.ohidden_funarg_list()
-		p.want(')')
-		s8 := p.ohidden_funres()
-
-		ss := methodname1(newname(s4), s2[0].Right)
-		ss.Type = functype(s2[0], s6, s8)
-
-		checkwidth(ss.Type)
-		addmethod(s4, ss.Type, p.structpkg, false, p.pragma&Nointerface != 0)
-		p.pragma = 0
-		funchdr(ss)
-
-		// inl.C's inlnode in on a dotmeth node expects to find the inlineable body as
-		// (dotmeth's type).Nname.Inl, and dotmeth's type has been pulled
-		// out by typecheck's lookdot as this $$.ttype. So by providing
-		// this back link here we avoid special casing there.
-		ss.Type.SetNname(ss)
-		return ss
 	}
 }
 
@@ -2031,7 +1918,7 @@ func (p *parser) fnbody() []*Node {
 		p.fnest--
 		p.want('}')
 		if body == nil {
-			body = []*Node{Nod(OEMPTY, nil, nil)}
+			body = []*Node{nod(OEMPTY, nil, nil)}
 		}
 		return body
 	}
@@ -2106,18 +1993,6 @@ func (p *parser) structdcl() []*Node {
 			return []*Node{field}
 		}
 
-		// LNAME belongs to first *Sym of new_name_list
-		//
-		// during imports, unqualified non-exported identifiers are from builtinpkg
-		if importpkg != nil && !exportname(sym.Name) {
-			sym = Pkglookup(sym.Name, builtinpkg)
-			if sym == nil {
-				p.import_error()
-			}
-		}
-		fallthrough
-
-	case '@', '?':
 		// new_name_list ntype oliteral
 		fields := p.new_name_list(sym)
 		typ := p.ntype()
@@ -2136,7 +2011,7 @@ func (p *parser) structdcl() []*Node {
 		}
 
 		for i, n := range fields {
-			fields[i] = Nod(ODCLFIELD, n, typ)
+			fields[i] = nod(ODCLFIELD, n, typ)
 			fields[i].SetVal(tag)
 		}
 		return fields
@@ -2149,9 +2024,9 @@ func (p *parser) structdcl() []*Node {
 			p.want(')')
 			tag := p.oliteral()
 
-			field.Right = Nod(OIND, field.Right, nil)
+			field.Right = nod(OIND, field.Right, nil)
 			field.SetVal(tag)
-			Yyerror("cannot parenthesize embedded type")
+			yyerror("cannot parenthesize embedded type")
 			return []*Node{field}
 
 		} else {
@@ -2161,7 +2036,7 @@ func (p *parser) structdcl() []*Node {
 			tag := p.oliteral()
 
 			field.SetVal(tag)
-			Yyerror("cannot parenthesize embedded type")
+			yyerror("cannot parenthesize embedded type")
 			return []*Node{field}
 		}
 
@@ -2173,9 +2048,9 @@ func (p *parser) structdcl() []*Node {
 			p.want(')')
 			tag := p.oliteral()
 
-			field.Right = Nod(OIND, field.Right, nil)
+			field.Right = nod(OIND, field.Right, nil)
 			field.SetVal(tag)
-			Yyerror("cannot parenthesize embedded type")
+			yyerror("cannot parenthesize embedded type")
 			return []*Node{field}
 
 		} else {
@@ -2183,7 +2058,7 @@ func (p *parser) structdcl() []*Node {
 			field := p.embed(nil)
 			tag := p.oliteral()
 
-			field.Right = Nod(OIND, field.Right, nil)
+			field.Right = nod(OIND, field.Right, nil)
 			field.SetVal(tag)
 			return []*Node{field}
 		}
@@ -2225,7 +2100,7 @@ func (p *parser) packname(name *Sym) *Sym {
 
 		var pkg *Pkg
 		if name.Def == nil || name.Def.Op != OPACK {
-			Yyerror("%v is not a package", name)
+			yyerror("%v is not a package", name)
 			pkg = localpkg
 		} else {
 			name.Def.Used = true
@@ -2277,33 +2152,14 @@ func (p *parser) interfacedcl() *Node {
 		if p.tok != '(' {
 			// packname
 			pname := p.packname(sym)
-			return Nod(ODCLFIELD, nil, oldname(pname))
+			return nod(ODCLFIELD, nil, oldname(pname))
 		}
 
 		// MethodName Signature
 		mname := newname(sym)
 		sig := p.signature(fakethis())
 
-		meth := Nod(ODCLFIELD, mname, sig)
-		ifacedcl(meth)
-		return meth
-
-	case '@', '?':
-		// MethodName Signature
-		//
-		// We arrive here when parsing an interface type declared inside
-		// an exported and inlineable function and the interface declares
-		// unexported methods (which are then package-qualified).
-		//
-		// Since the compiler always flattens embedded interfaces, we
-		// will never see an embedded package-qualified interface in export
-		// data; i.e., when we reach here we know it must be a method.
-		//
-		// See also issue 14164.
-		mname := newname(p.sym())
-		sig := p.signature(fakethis())
-
-		meth := Nod(ODCLFIELD, mname, sig)
+		meth := nod(ODCLFIELD, mname, sig)
 		ifacedcl(meth)
 		return meth
 
@@ -2311,8 +2167,8 @@ func (p *parser) interfacedcl() *Node {
 		p.next()
 		pname := p.packname(nil)
 		p.want(')')
-		n := Nod(ODCLFIELD, nil, oldname(pname))
-		Yyerror("cannot parenthesize embedded type")
+		n := nod(ODCLFIELD, nil, oldname(pname))
+		yyerror("cannot parenthesize embedded type")
 		return n
 
 	default:
@@ -2334,10 +2190,10 @@ func (p *parser) param() (name *Sym, typ *Node) {
 	}
 
 	switch p.tok {
-	case LNAME, '@', '?':
-		name = p.sym() // nil if p.tok == '?' (importing only)
+	case LNAME:
+		name = p.sym()
 		switch p.tok {
-		case LCOMM, LFUNC, '[', LCHAN, LMAP, LSTRUCT, LINTERFACE, '*', LNAME, '@', '?', '(':
+		case LCOMM, LFUNC, '[', LCHAN, LMAP, LSTRUCT, LINTERFACE, '*', LNAME, '(':
 			// sym name_or_type
 			typ = p.ntype()
 
@@ -2423,13 +2279,7 @@ func (p *parser) param_list(dddOk bool) []*Node {
 				// explicit type: use type for earlier parameters
 				T = t
 				// an explicitly typed entry must have a name
-				// TODO(gri) remove extra importpkg == nil check below
-				//           after switch to binary eport format
-				// Exported inlined function bodies containing function
-				// literals may print parameter names as '?' resulting
-				// in nil *Sym and thus nil names. Don't report an error
-				// in this case.
-				if p.name == nil && importpkg == nil {
+				if p.name == nil {
 					T = nil // error
 				}
 			} else {
@@ -2437,7 +2287,7 @@ func (p *parser) param_list(dddOk bool) []*Node {
 				p.typ = T
 			}
 			if T == nil {
-				Yyerror("mixed named and unnamed function parameters")
+				yyerror("mixed named and unnamed function parameters")
 				break
 			}
 		}
@@ -2459,14 +2309,14 @@ func (p *parser) param_list(dddOk bool) []*Node {
 			// p.name must be a type name (or nil in case of syntax error)
 			typ = mkname(p.name)
 		}
-		n := Nod(ODCLFIELD, name, typ)
+		n := nod(ODCLFIELD, name, typ)
 
 		// rewrite ...T parameter
 		if typ != nil && typ.Op == ODDD {
 			if !dddOk {
-				Yyerror("cannot use ... in receiver or result parameter list")
+				yyerror("cannot use ... in receiver or result parameter list")
 			} else if i+1 < len(params) {
-				Yyerror("can only use ... with final parameter in list")
+				yyerror("can only use ... with final parameter in list")
 			}
 			typ.Op = OTARRAY
 			typ.Right = typ.Left
@@ -2483,7 +2333,7 @@ func (p *parser) param_list(dddOk bool) []*Node {
 	return list
 }
 
-var missing_stmt = Nod(OXXX, nil, nil)
+var missing_stmt = nod(OXXX, nil, nil)
 
 // Statement =
 // 	Declaration | LabeledStmt | SimpleStmt |
@@ -2504,7 +2354,7 @@ func (p *parser) stmt() *Node {
 	case LVAR, LCONST, LTYPE:
 		return liststmt(p.common_dcl())
 
-	case LNAME, '@', '?', LLITERAL, LFUNC, '(', // operands
+	case LNAME, LLITERAL, LFUNC, '(', // operands
 		'[', LSTRUCT, LMAP, LCHAN, LINTERFACE, // composite types
 		'+', '-', '*', '&', '^', LCOMM, '!': // unary operators
 		return p.simple_stmt(true, false)
@@ -2524,29 +2374,29 @@ func (p *parser) stmt() *Node {
 	case LFALL:
 		p.next()
 		// will be converted to OFALL
-		stmt := Nod(OXFALL, nil, nil)
+		stmt := nod(OXFALL, nil, nil)
 		stmt.Xoffset = int64(block)
 		return stmt
 
 	case LBREAK:
 		p.next()
-		return Nod(OBREAK, p.onew_name(), nil)
+		return nod(OBREAK, p.onew_name(), nil)
 
 	case LCONTINUE:
 		p.next()
-		return Nod(OCONTINUE, p.onew_name(), nil)
+		return nod(OCONTINUE, p.onew_name(), nil)
 
 	case LGO:
 		p.next()
-		return Nod(OPROC, p.pseudocall(), nil)
+		return nod(OPROC, p.pseudocall(), nil)
 
 	case LDEFER:
 		p.next()
-		return Nod(ODEFER, p.pseudocall(), nil)
+		return nod(ODEFER, p.pseudocall(), nil)
 
 	case LGOTO:
 		p.next()
-		stmt := Nod(OGOTO, p.new_name(p.sym()), nil)
+		stmt := nod(OGOTO, p.new_name(p.sym()), nil)
 		stmt.Sym = dclstack // context, for goto restrictions
 		return stmt
 
@@ -2557,7 +2407,7 @@ func (p *parser) stmt() *Node {
 			results = p.expr_list()
 		}
 
-		stmt := Nod(ORETURN, nil, nil)
+		stmt := nod(ORETURN, nil, nil)
 		stmt.List.Set(results)
 		if stmt.List.Len() == 0 && Curfn != nil {
 			for _, ln := range Curfn.Func.Dcl {
@@ -2568,7 +2418,7 @@ func (p *parser) stmt() *Node {
 					break
 				}
 				if ln.Sym.Def != ln {
-					Yyerror("%s is shadowed during return", ln.Sym.Name)
+					yyerror("%s is shadowed during return", ln.Sym.Name)
 				}
 			}
 		}
@@ -2719,635 +2569,4 @@ func (p *parser) ocomma(follow int32) bool {
 	p.syntax_error("expecting comma or " + tokstring(follow))
 	p.advance(follow)
 	return false
-}
-
-// ----------------------------------------------------------------------------
-// Importing packages
-
-func (p *parser) import_error() {
-	p.syntax_error("in export data of imported package")
-	p.next()
-}
-
-// The methods below reflect a 1:1 translation of the original (and now defunct)
-// go.y yacc productions. They could be simplified significantly and also use better
-// variable names. However, we will be able to delete them once we enable the
-// new export format by default, so it's not worth the effort (issue 13241).
-
-func (p *parser) hidden_importsym() *Sym {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_importsym")()
-	}
-
-	p.want('@')
-	var s2 Val
-	if p.tok == LLITERAL {
-		s2 = p.val
-		p.next()
-	} else {
-		p.import_error()
-	}
-	p.want('.')
-
-	switch p.tok {
-	case LNAME:
-		s4 := p.sym_
-		p.next()
-
-		var p *Pkg
-
-		if s2.U.(string) == "" {
-			p = importpkg
-		} else {
-			if isbadimport(s2.U.(string)) {
-				errorexit()
-			}
-			p = mkpkg(s2.U.(string))
-		}
-		return Pkglookup(s4.Name, p)
-
-	case '?':
-		p.next()
-
-		var p *Pkg
-
-		if s2.U.(string) == "" {
-			p = importpkg
-		} else {
-			if isbadimport(s2.U.(string)) {
-				errorexit()
-			}
-			p = mkpkg(s2.U.(string))
-		}
-		return Pkglookup("?", p)
-
-	default:
-		p.import_error()
-		return nil
-	}
-}
-
-func (p *parser) ohidden_funarg_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("ohidden_funarg_list")()
-	}
-
-	var ss []*Node
-	if p.tok != ')' {
-		ss = p.hidden_funarg_list()
-	}
-	return ss
-}
-
-func (p *parser) ohidden_structdcl_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("ohidden_structdcl_list")()
-	}
-
-	var ss []*Node
-	if p.tok != '}' {
-		ss = p.hidden_structdcl_list()
-	}
-	return ss
-}
-
-func (p *parser) ohidden_interfacedcl_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("ohidden_interfacedcl_list")()
-	}
-
-	var ss []*Node
-	if p.tok != '}' {
-		ss = p.hidden_interfacedcl_list()
-	}
-	return ss
-}
-
-// import syntax from package header
-func (p *parser) hidden_import() {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_import")()
-	}
-
-	switch p.tok {
-	case LIMPORT:
-		// LIMPORT LNAME LLITERAL ';'
-		p.next()
-		var s2 *Sym
-		if p.tok == LNAME {
-			s2 = p.sym_
-			p.next()
-		} else {
-			p.import_error()
-		}
-		var s3 Val
-		if p.tok == LLITERAL {
-			s3 = p.val
-			p.next()
-		} else {
-			p.import_error()
-		}
-		p.want(';')
-
-		importimport(s2, s3.U.(string))
-
-	case LVAR:
-		// LVAR hidden_pkg_importsym hidden_type ';'
-		p.next()
-		s2 := p.hidden_pkg_importsym()
-		s3 := p.hidden_type()
-		p.want(';')
-
-		importvar(s2, s3)
-
-	case LCONST:
-		// LCONST hidden_pkg_importsym '=' hidden_constant ';'
-		// LCONST hidden_pkg_importsym hidden_type '=' hidden_constant ';'
-		p.next()
-		s2 := p.hidden_pkg_importsym()
-		var s3 *Type = Types[TIDEAL]
-		if p.tok != '=' {
-			s3 = p.hidden_type()
-		}
-		p.want('=')
-		s4 := p.hidden_constant()
-		p.want(';')
-
-		importconst(s2, s3, s4)
-
-	case LTYPE:
-		// LTYPE hidden_pkgtype hidden_type ';'
-		p.next()
-		s2 := p.hidden_pkgtype()
-		s3 := p.hidden_type()
-		p.want(';')
-
-		importtype(s2, s3)
-
-	case LFUNC:
-		// LFUNC hidden_fndcl fnbody ';'
-		p.next()
-		s2 := p.hidden_fndcl()
-		s3 := p.fnbody()
-		p.want(';')
-
-		if s2 == nil {
-			dclcontext = PEXTERN // since we skip the funcbody below
-			return
-		}
-
-		s2.Func.Inl.Set(s3)
-
-		funcbody(s2)
-		importlist = append(importlist, s2)
-
-		if Debug['E'] > 0 {
-			fmt.Printf("import [%q] func %v \n", importpkg.Path, s2)
-			if Debug['m'] > 2 && s2.Func.Inl.Len() != 0 {
-				fmt.Printf("inl body:%v\n", s2.Func.Inl)
-			}
-		}
-
-	default:
-		p.import_error()
-	}
-}
-
-func (p *parser) hidden_pkg_importsym() *Sym {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_pkg_importsym")()
-	}
-
-	s := p.hidden_importsym()
-	p.structpkg = s.Pkg
-	return s
-}
-
-func (p *parser) hidden_pkgtype() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_pkgtype")()
-	}
-
-	return pkgtype(p.hidden_pkg_importsym())
-}
-
-// ----------------------------------------------------------------------------
-// Importing types
-
-func (p *parser) hidden_type() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_type")()
-	}
-
-	switch p.tok {
-	default:
-		return p.hidden_type_misc()
-	case LCOMM:
-		return p.hidden_type_recv_chan()
-	case LFUNC:
-		return p.hidden_type_func()
-	}
-}
-
-func (p *parser) hidden_type_non_recv_chan() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_type_non_recv_chan")()
-	}
-
-	switch p.tok {
-	default:
-		return p.hidden_type_misc()
-	case LFUNC:
-		return p.hidden_type_func()
-	}
-}
-
-func (p *parser) hidden_type_misc() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_type_misc")()
-	}
-
-	switch p.tok {
-	case '@':
-		// hidden_importsym
-		s1 := p.hidden_importsym()
-		return pkgtype(s1)
-
-	case LNAME:
-		// LNAME
-		s1 := p.sym_
-		p.next()
-
-		// predefined name like uint8
-		s1 = Pkglookup(s1.Name, builtinpkg)
-		if s1.Def == nil || s1.Def.Op != OTYPE {
-			Yyerror("%s is not a type", s1.Name)
-			return nil
-		} else {
-			return s1.Def.Type
-		}
-
-	case '[':
-		// '[' ']' hidden_type
-		// '[' LLITERAL ']' hidden_type
-		p.next()
-		var s2 *Node
-		if p.tok == LLITERAL {
-			s2 = nodlit(p.val)
-			p.next()
-		}
-		p.want(']')
-		s4 := p.hidden_type()
-
-		return aindex(s2, s4)
-
-	case LMAP:
-		// LMAP '[' hidden_type ']' hidden_type
-		p.next()
-		p.want('[')
-		s3 := p.hidden_type()
-		p.want(']')
-		s5 := p.hidden_type()
-
-		return typMap(s3, s5)
-
-	case LSTRUCT:
-		// LSTRUCT '{' ohidden_structdcl_list '}'
-		p.next()
-		p.want('{')
-		s3 := p.ohidden_structdcl_list()
-		p.want('}')
-
-		return tostruct(s3)
-
-	case LINTERFACE:
-		// LINTERFACE '{' ohidden_interfacedcl_list '}'
-		p.next()
-		p.want('{')
-		s3 := p.ohidden_interfacedcl_list()
-		p.want('}')
-
-		return tointerface(s3)
-
-	case '*':
-		// '*' hidden_type
-		p.next()
-		s2 := p.hidden_type()
-		return Ptrto(s2)
-
-	case LCHAN:
-		p.next()
-		switch p.tok {
-		default:
-			// LCHAN hidden_type_non_recv_chan
-			s2 := p.hidden_type_non_recv_chan()
-			ss := typChan(s2, Cboth)
-			return ss
-
-		case '(':
-			// LCHAN '(' hidden_type_recv_chan ')'
-			p.next()
-			s3 := p.hidden_type_recv_chan()
-			p.want(')')
-			ss := typChan(s3, Cboth)
-			return ss
-
-		case LCOMM:
-			// LCHAN hidden_type
-			p.next()
-			s3 := p.hidden_type()
-			ss := typChan(s3, Csend)
-			return ss
-		}
-
-	default:
-		p.import_error()
-		return nil
-	}
-}
-
-func (p *parser) hidden_type_recv_chan() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_type_recv_chan")()
-	}
-
-	p.want(LCOMM)
-	p.want(LCHAN)
-	s3 := p.hidden_type()
-
-	ss := typChan(s3, Crecv)
-	return ss
-}
-
-func (p *parser) hidden_type_func() *Type {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_type_func")()
-	}
-
-	p.want(LFUNC)
-	p.want('(')
-	s3 := p.ohidden_funarg_list()
-	p.want(')')
-	s5 := p.ohidden_funres()
-
-	return functype(nil, s3, s5)
-}
-
-func (p *parser) hidden_funarg() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_funarg")()
-	}
-
-	s1 := p.sym()
-	switch p.tok {
-	default:
-		s2 := p.hidden_type()
-		s3 := p.oliteral()
-
-		ss := Nod(ODCLFIELD, nil, typenod(s2))
-		if s1 != nil {
-			ss.Left = newname(s1)
-		}
-		ss.SetVal(s3)
-		return ss
-
-	case LDDD:
-		p.next()
-		s3 := p.hidden_type()
-		s4 := p.oliteral()
-
-		t := typSlice(s3)
-
-		ss := Nod(ODCLFIELD, nil, typenod(t))
-		if s1 != nil {
-			ss.Left = newname(s1)
-		}
-		ss.Isddd = true
-		ss.SetVal(s4)
-
-		return ss
-	}
-}
-
-func (p *parser) hidden_structdcl() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_structdcl")()
-	}
-
-	s1 := p.sym()
-	s2 := p.hidden_type()
-	s3 := p.oliteral()
-
-	var ss *Node
-	if s1 != nil && s1.Name != "?" {
-		ss = Nod(ODCLFIELD, newname(s1), typenod(s2))
-		ss.SetVal(s3)
-	} else {
-		s := s2.Sym
-		if s == nil && s2.IsPtr() {
-			s = s2.Elem().Sym
-		}
-		pkg := importpkg
-		if s1 != nil {
-			pkg = s1.Pkg
-		}
-		ss = embedded(s, pkg)
-		ss.Right = typenod(s2)
-		ss.SetVal(s3)
-	}
-
-	return ss
-}
-
-func (p *parser) hidden_interfacedcl() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_interfacedcl")()
-	}
-
-	// The original (now defunct) grammar in go.y accepted both a method
-	// or an (embedded) type:
-	//
-	// hidden_interfacedcl:
-	// 	sym '(' ohidden_funarg_list ')' ohidden_funres
-	// 	{
-	// 		$$ = Nod(ODCLFIELD, newname($1), typenod(functype(fakethis(), $3, $5)));
-	// 	}
-	// |	hidden_type
-	// 	{
-	// 		$$ = Nod(ODCLFIELD, nil, typenod($1));
-	// 	}
-	//
-	// But the current textual export code only exports (inlined) methods,
-	// even if the methods came from embedded interfaces. Furthermore, in
-	// the original grammar, hidden_type may also start with a sym (LNAME
-	// or '@'), complicating matters further. Since we never have embedded
-	// types, only parse methods here.
-
-	s1 := p.sym()
-	p.want('(')
-	s3 := p.ohidden_funarg_list()
-	p.want(')')
-	s5 := p.ohidden_funres()
-
-	return Nod(ODCLFIELD, newname(s1), typenod(functype(fakethis(), s3, s5)))
-}
-
-func (p *parser) ohidden_funres() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("ohidden_funres")()
-	}
-
-	switch p.tok {
-	default:
-		return nil
-
-	case '(', '@', LNAME, '[', LMAP, LSTRUCT, LINTERFACE, '*', LCHAN, LCOMM, LFUNC:
-		return p.hidden_funres()
-	}
-}
-
-func (p *parser) hidden_funres() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_funres")()
-	}
-
-	switch p.tok {
-	case '(':
-		p.next()
-		s2 := p.ohidden_funarg_list()
-		p.want(')')
-		return s2
-
-	default:
-		s1 := p.hidden_type()
-		return []*Node{Nod(ODCLFIELD, nil, typenod(s1))}
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Importing constants
-
-func (p *parser) hidden_literal() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_literal")()
-	}
-
-	switch p.tok {
-	case LLITERAL:
-		ss := nodlit(p.val)
-		p.next()
-		return ss
-
-	case '-':
-		p.next()
-		if p.tok == LLITERAL {
-			ss := nodlit(p.val)
-			p.next()
-			switch u := ss.Val().U.(type) {
-			case *Mpint:
-				u.Neg()
-			case *Mpflt:
-				u.Neg()
-			case *Mpcplx:
-				u.Real.Neg()
-				u.Imag.Neg()
-			default:
-				Yyerror("bad negated constant")
-			}
-			return ss
-		} else {
-			p.import_error()
-			return nil
-		}
-
-	case LNAME, '@', '?':
-		s1 := p.sym()
-		ss := oldname(Pkglookup(s1.Name, builtinpkg))
-		if ss.Op != OLITERAL {
-			Yyerror("bad constant %v", ss.Sym)
-		}
-		return ss
-
-	default:
-		p.import_error()
-		return nil
-	}
-}
-
-func (p *parser) hidden_constant() *Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_constant")()
-	}
-
-	switch p.tok {
-	default:
-		return p.hidden_literal()
-	case '(':
-		p.next()
-		s2 := p.hidden_literal()
-		p.want('+')
-		s4 := p.hidden_literal()
-		p.want(')')
-
-		if s2.Val().Ctype() == CTRUNE && s4.Val().Ctype() == CTINT {
-			ss := s2
-			s2.Val().U.(*Mpint).Add(s4.Val().U.(*Mpint))
-			return ss
-		}
-		s4.Val().U.(*Mpcplx).Real = s4.Val().U.(*Mpcplx).Imag
-		s4.Val().U.(*Mpcplx).Imag.SetFloat64(0.0)
-		return nodcplxlit(s2.Val(), s4.Val())
-	}
-}
-
-func (p *parser) hidden_import_list() {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_import_list")()
-	}
-
-	for p.tok != '$' {
-		p.hidden_import()
-	}
-}
-
-func (p *parser) hidden_funarg_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_funarg_list")()
-	}
-
-	s1 := p.hidden_funarg()
-	ss := []*Node{s1}
-	for p.got(',') {
-		s3 := p.hidden_funarg()
-		ss = append(ss, s3)
-	}
-	return ss
-}
-
-func (p *parser) hidden_structdcl_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_structdcl_list")()
-	}
-
-	s1 := p.hidden_structdcl()
-	ss := []*Node{s1}
-	for p.got(';') {
-		s3 := p.hidden_structdcl()
-		ss = append(ss, s3)
-	}
-	return ss
-}
-
-func (p *parser) hidden_interfacedcl_list() []*Node {
-	if trace && Debug['x'] != 0 {
-		defer p.trace("hidden_interfacedcl_list")()
-	}
-
-	s1 := p.hidden_interfacedcl()
-	ss := []*Node{s1}
-	for p.got(';') {
-		s3 := p.hidden_interfacedcl()
-		ss = append(ss, s3)
-	}
-	return ss
 }

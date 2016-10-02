@@ -131,13 +131,13 @@ func cse(f *Func) {
 		}
 	}
 
-	// Dominator tree (f.sdom) is computed by the generic domtree pass.
+	sdom := f.sdom()
 
 	// Compute substitutions we would like to do. We substitute v for w
 	// if v and w are in the same equivalence class and v dominates w.
 	rewrite := make([]*Value, f.NumValues())
 	for _, e := range partition {
-		sort.Sort(partitionByDom{e, f.sdom})
+		sort.Sort(partitionByDom{e, sdom})
 		for i := 0; i < len(e)-1; i++ {
 			// e is sorted by domorder, so a maximal dominant element is first in the slice
 			v := e[i]
@@ -152,13 +152,47 @@ func cse(f *Func) {
 				if w == nil {
 					continue
 				}
-				if f.sdom.isAncestorEq(v.Block, w.Block) {
+				if sdom.isAncestorEq(v.Block, w.Block) {
 					rewrite[w.ID] = v
 					e[j] = nil
 				} else {
 					// e is sorted by domorder, so v.Block doesn't dominate any subsequent blocks in e
 					break
 				}
+			}
+		}
+	}
+
+	// if we rewrite a tuple generator to a new one in a different block,
+	// copy its selectors to the new generator's block, so tuple generator
+	// and selectors stay together.
+	// be careful not to copy same selectors more than once (issue 16741).
+	copiedSelects := make(map[ID][]*Value)
+	for _, b := range f.Blocks {
+	out:
+		for _, v := range b.Values {
+			if rewrite[v.ID] != nil {
+				continue
+			}
+			if v.Op != OpSelect0 && v.Op != OpSelect1 {
+				continue
+			}
+			if !v.Args[0].Type.IsTuple() {
+				f.Fatalf("arg of tuple selector %s is not a tuple: %s", v.String(), v.Args[0].LongString())
+			}
+			t := rewrite[v.Args[0].ID]
+			if t != nil && t.Block != b {
+				// v.Args[0] is tuple generator, CSE'd into a different block as t, v is left behind
+				for _, c := range copiedSelects[t.ID] {
+					if v.Op == c.Op {
+						// an equivalent selector is already copied
+						rewrite[v.ID] = c
+						continue out
+					}
+				}
+				c := v.copyInto(t.Block)
+				rewrite[v.ID] = c
+				copiedSelects[t.ID] = append(copiedSelects[t.ID], c)
 			}
 		}
 	}

@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 // ResponseRecorder is an implementation of http.ResponseWriter that
@@ -136,6 +138,9 @@ func (rw *ResponseRecorder) Flush() {
 // first write call, or at the time of this call, if the handler never
 // did a write.
 //
+// The Response.Body is guaranteed to be non-nil and Body.Read call is
+// guaranteed to not return any error other than io.EOF.
+//
 // Result must only be called after the handler has finished running.
 func (rw *ResponseRecorder) Result() *http.Response {
 	if rw.result != nil {
@@ -159,6 +164,7 @@ func (rw *ResponseRecorder) Result() *http.Response {
 	if rw.Body != nil {
 		res.Body = ioutil.NopCloser(bytes.NewReader(rw.Body.Bytes()))
 	}
+	res.ContentLength = parseContentLength(res.Header.Get("Content-Length"))
 
 	if trailers, ok := rw.snapHeader["Trailer"]; ok {
 		res.Trailer = make(http.Header, len(trailers))
@@ -182,4 +188,21 @@ func (rw *ResponseRecorder) Result() *http.Response {
 		}
 	}
 	return res
+}
+
+// parseContentLength trims whitespace from s and returns -1 if no value
+// is set, or the value if it's >= 0.
+//
+// This a modified version of same function found in net/http/transfer.go. This
+// one just ignores an invalid header.
+func parseContentLength(cl string) int64 {
+	cl = strings.TrimSpace(cl)
+	if cl == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(cl, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
 }
