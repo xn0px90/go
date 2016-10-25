@@ -24,6 +24,8 @@ import (
 	"unicode"
 )
 
+var ignoreImports bool // control whether we ignore imports in packages
+
 // A Package describes a single package found in a directory.
 type Package struct {
 	// Note: These fields are part of the go command's public API.
@@ -181,6 +183,11 @@ func (p *Package) copyBuild(pp *build.Package) {
 	p.TestImports = pp.TestImports
 	p.XTestGoFiles = pp.XTestGoFiles
 	p.XTestImports = pp.XTestImports
+	if ignoreImports {
+		p.Imports = nil
+		p.TestImports = nil
+		p.XTestImports = nil
+	}
 }
 
 // isStandardImportPath reports whether $GOROOT/src/path should be considered
@@ -415,13 +422,26 @@ func vendoredImportPath(parent *Package, path string) (found string) {
 
 	dir := filepath.Clean(parent.Dir)
 	root := filepath.Join(parent.Root, "src")
-	if !hasFilePathPrefix(dir, root) {
+	if !hasFilePathPrefix(dir, root) || parent.ImportPath != "command-line-arguments" && filepath.Join(root, parent.ImportPath) != dir {
 		// Look for symlinks before reporting error.
 		dir = expandPath(dir)
 		root = expandPath(root)
 	}
-	if !hasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator {
-		fatalf("invalid vendoredImportPath: dir=%q root=%q separator=%q", dir, root, string(filepath.Separator))
+
+	if !hasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator || parent.ImportPath != "command-line-arguments" && filepath.Join(root, parent.ImportPath) != dir {
+		fatalf("unexpected directory layout:\n"+
+			"	import path: %s\n"+
+			"	root: %s\n"+
+			"	dir: %s\n"+
+			"	expand root: %s\n"+
+			"	expand dir: %s\n"+
+			"	separator: %s",
+			parent.ImportPath,
+			filepath.Join(parent.Root, "src"),
+			filepath.Clean(parent.Dir),
+			root,
+			dir,
+			string(filepath.Separator))
 	}
 
 	vpath := "vendor/" + path

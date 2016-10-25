@@ -53,6 +53,8 @@ For example:
 	// #include <png.h>
 	import "C"
 
+The default pkg-config tool may be changed by setting the PKG_CONFIG environment variable.
+
 When building, the CGO_CFLAGS, CGO_CPPFLAGS, CGO_CXXFLAGS, CGO_FFLAGS and
 CGO_LDFLAGS environment variables are added to the flags derived from
 these directives.  Package-specific flags should be set using the
@@ -213,6 +215,13 @@ by making copies of the data.  In pseudo-Go definitions:
 
 	// C data with explicit length to Go []byte
 	func C.GoBytes(unsafe.Pointer, C.int) []byte
+
+As a special case, C.malloc does not call the C library malloc directly
+but instead calls a Go helper function that wraps the C library malloc
+but guarantees never to return nil. If C's malloc indicates out of memory,
+the helper function crashes the program, like when Go itself runs out
+of memory. Because C.malloc cannot fail, it has no two-result form
+that returns errno.
 
 C references to Go
 

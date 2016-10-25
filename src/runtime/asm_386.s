@@ -354,13 +354,15 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	g_m(BX), BX
 	MOVL	m_g0(BX), SI
 	CMPL	g(CX), SI
-	JNE	2(PC)
+	JNE	3(PC)
+	CALL	runtime·badmorestackg0(SB)
 	INT	$3
 
 	// Cannot grow signal stack.
 	MOVL	m_gsignal(BX), SI
 	CMPL	g(CX), SI
-	JNE	2(PC)
+	JNE	3(PC)
+	CALL	runtime·badmorestackgsignal(SB)
 	INT	$3
 
 	// Called from f.
@@ -379,7 +381,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	SI, (g_sched+gobuf_g)(SI)
 	LEAL	4(SP), AX	// f's SP
 	MOVL	AX, (g_sched+gobuf_sp)(SI)
-	MOVL	DX, (g_sched+gobuf_ctxt)(SI)
+	// newstack will fill gobuf.ctxt.
 
 	// Call newstack on m->g0's stack.
 	MOVL	m_g0(BX), BP
@@ -387,8 +389,10 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	(g_sched+gobuf_sp)(BP), AX
 	MOVL	-4(AX), BX	// fault if CALL would, before smashing SP
 	MOVL	AX, SP
+	PUSHL	DX	// ctxt argument
 	CALL	runtime·newstack(SB)
 	MOVL	$0, 0x1003	// crash if newstack returns
+	POPL	DX	// keep balance check happy
 	RET
 
 TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0-0

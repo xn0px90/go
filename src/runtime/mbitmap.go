@@ -264,7 +264,11 @@ func (s *mspan) nextFreeIndex() uintptr {
 	return result
 }
 
+// isFree returns whether the index'th object in s is unallocated.
 func (s *mspan) isFree(index uintptr) bool {
+	if index < s.freeindex {
+		return false
+	}
 	whichByte := index / 8
 	whichBit := index % 8
 	byteVal := *addb(s.allocBits, whichByte)
@@ -336,7 +340,7 @@ func (m markBits) clearMarkedNonAtomic() {
 // markBitsForSpan returns the markBits for the span base address base.
 func markBitsForSpan(base uintptr) (mbits markBits) {
 	if base < mheap_.arena_start || base >= mheap_.arena_used {
-		throw("heapBitsForSpan: base out of range")
+		throw("markBitsForSpan: base out of range")
 	}
 	mbits = markBitsForAddr(base)
 	if mbits.mask != 1 {
@@ -421,7 +425,7 @@ func heapBitsForObject(p, refBase, refOff uintptr) (base uintptr, hbits heapBits
 			} else {
 				print(" to unused region of span")
 			}
-			print("idx=", hex(idx), " span.base()=", hex(s.base()), " span.limit=", hex(s.limit), " span.state=", s.state, "\n")
+			print(" idx=", hex(idx), " span.base()=", hex(s.base()), " span.limit=", hex(s.limit), " span.state=", s.state, "\n")
 			if refBase != 0 {
 				print("runtime: found in object at *(", hex(refBase), "+", hex(refOff), ")\n")
 				gcDumpObject("object", refBase, refOff)

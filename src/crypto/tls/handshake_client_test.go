@@ -77,7 +77,7 @@ func newOpensslOutputSink() *opensslOutputSink {
 
 // opensslEndOfHandshake is a message that the “openssl s_server” tool will
 // print when a handshake completes if run with “-state”.
-const opensslEndOfHandshake = "SSL_accept:SSLv3 write finished A"
+const opensslEndOfHandshake = "SSL_accept:SSLv3/TLS write finished"
 
 func (o *opensslOutputSink) Write(data []byte) (n int, err error) {
 	o.line = append(o.line, data...)
@@ -276,6 +276,8 @@ func (test *clientTest) loadData() (flows [][]byte, err error) {
 }
 
 func (test *clientTest) run(t *testing.T, write bool) {
+	checkOpenSSLVersion(t)
+
 	var clientConn, serverConn net.Conn
 	var recordingConn *recordingConn
 	var childProcess *exec.Cmd
@@ -410,7 +412,7 @@ func (test *clientTest) run(t *testing.T, write bool) {
 		childProcess.Process.Kill()
 		childProcess.Wait()
 		if len(recordingConn.flows) < 3 {
-			childProcess.Stdout.(*bytes.Buffer).WriteTo(os.Stdout)
+			os.Stdout.Write(childProcess.Stdout.(*opensslOutputSink).all)
 			t.Fatalf("Client connection didn't work")
 		}
 		recordingConn.WriteTo(out)
@@ -535,6 +537,47 @@ func TestHandshakeClientECDHEECDSAAES128CBCSHA256(t *testing.T) {
 	runClientTestTLS12(t, test)
 }
 
+func TestHandshakeClientX25519(t *testing.T) {
+	config := testConfig.Clone()
+	config.CurvePreferences = []CurveID{X25519}
+
+	test := &clientTest{
+		name:    "X25519-ECDHE-RSA-AES-GCM",
+		command: []string{"openssl", "s_server", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256"},
+		config:  config,
+	}
+
+	runClientTestTLS12(t, test)
+}
+
+func TestHandshakeClientECDHERSAChaCha20(t *testing.T) {
+	config := testConfig.Clone()
+	config.CipherSuites = []uint16{TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305}
+
+	test := &clientTest{
+		name:    "ECDHE-RSA-CHACHA20-POLY1305",
+		command: []string{"openssl", "s_server", "-cipher", "ECDHE-RSA-CHACHA20-POLY1305"},
+		config:  config,
+	}
+
+	runClientTestTLS12(t, test)
+}
+
+func TestHandshakeClientECDHEECDSAChaCha20(t *testing.T) {
+	config := testConfig.Clone()
+	config.CipherSuites = []uint16{TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305}
+
+	test := &clientTest{
+		name:    "ECDHE-ECDSA-CHACHA20-POLY1305",
+		command: []string{"openssl", "s_server", "-cipher", "ECDHE-ECDSA-CHACHA20-POLY1305"},
+		config:  config,
+		cert:    testECDSACertificate,
+		key:     testECDSAPrivateKey,
+	}
+
+	runClientTestTLS12(t, test)
+}
+
 func TestHandshakeClientCertRSA(t *testing.T) {
 	config := testConfig.Clone()
 	cert, _ := X509KeyPair([]byte(clientCertificatePEM), []byte(clientKeyPEM))
@@ -542,7 +585,7 @@ func TestHandshakeClientCertRSA(t *testing.T) {
 
 	test := &clientTest{
 		name:    "ClientCert-RSA-RSA",
-		command: []string{"openssl", "s_server", "-cipher", "RC4-SHA", "-verify", "1"},
+		command: []string{"openssl", "s_server", "-cipher", "AES128", "-verify", "1"},
 		config:  config,
 	}
 
@@ -578,7 +621,7 @@ func TestHandshakeClientCertECDSA(t *testing.T) {
 
 	test := &clientTest{
 		name:    "ClientCert-ECDSA-RSA",
-		command: []string{"openssl", "s_server", "-cipher", "RC4-SHA", "-verify", "1"},
+		command: []string{"openssl", "s_server", "-cipher", "AES128", "-verify", "1"},
 		config:  config,
 	}
 
@@ -793,27 +836,6 @@ func TestHandshakeClientALPNMatch(t *testing.T) {
 			// The server's preferences should override the client.
 			if state.NegotiatedProtocol != "proto1" {
 				return fmt.Errorf("Got protocol %q, wanted proto1", state.NegotiatedProtocol)
-			}
-			return nil
-		},
-	}
-	runClientTestTLS12(t, test)
-}
-
-func TestHandshakeClientALPNNoMatch(t *testing.T) {
-	config := testConfig.Clone()
-	config.NextProtos = []string{"proto3"}
-
-	test := &clientTest{
-		name: "ALPN-NoMatch",
-		// Note that this needs OpenSSL 1.0.2 because that is the first
-		// version that supports the -alpn flag.
-		command: []string{"openssl", "s_server", "-alpn", "proto1,proto2"},
-		config:  config,
-		validate: func(state ConnectionState) error {
-			// There's no overlap so OpenSSL will not select a protocol.
-			if state.NegotiatedProtocol != "" {
-				return fmt.Errorf("Got protocol %q, wanted ''", state.NegotiatedProtocol)
 			}
 			return nil
 		},
@@ -1042,6 +1064,160 @@ func TestServerSelectingUnconfiguredCipherSuite(t *testing.T) {
 
 	if err := <-errChan; !strings.Contains(err.Error(), "unconfigured cipher") {
 		t.Fatalf("Expected error about unconfigured cipher suite but got %q", err)
+	}
+}
+
+func TestVerifyPeerCertificate(t *testing.T) {
+	issuer, err := x509.ParseCertificate(testRSACertificateIssuer)
+	if err != nil {
+		panic(err)
+	}
+
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(issuer)
+
+	now := func() time.Time { return time.Unix(1476984729, 0) }
+
+	sentinelErr := errors.New("TestVerifyPeerCertificate")
+
+	verifyCallback := func(called *bool, rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+		if l := len(rawCerts); l != 1 {
+			return fmt.Errorf("got len(rawCerts) = %d, wanted 1", l)
+		}
+		if len(validatedChains) == 0 {
+			return errors.New("got len(validatedChains) = 0, wanted non-zero")
+		}
+		*called = true
+		return nil
+	}
+
+	tests := []struct {
+		configureServer func(*Config, *bool)
+		configureClient func(*Config, *bool)
+		validate        func(t *testing.T, testNo int, clientCalled, serverCalled bool, clientErr, serverErr error)
+	}{
+		{
+			configureServer: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = false
+				config.VerifyPeerCertificate = func(rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+					return verifyCallback(called, rawCerts, validatedChains)
+				}
+			},
+			configureClient: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = false
+				config.VerifyPeerCertificate = func(rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+					return verifyCallback(called, rawCerts, validatedChains)
+				}
+			},
+			validate: func(t *testing.T, testNo int, clientCalled, serverCalled bool, clientErr, serverErr error) {
+				if clientErr != nil {
+					t.Errorf("#%d: client handshake failed: %v", testNo, clientErr)
+				}
+				if serverErr != nil {
+					t.Errorf("#%d: server handshake failed: %v", testNo, serverErr)
+				}
+				if !clientCalled {
+					t.Error("#%d: client did not call callback", testNo)
+				}
+				if !serverCalled {
+					t.Error("#%d: server did not call callback", testNo)
+				}
+			},
+		},
+		{
+			configureServer: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = false
+				config.VerifyPeerCertificate = func(rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+					return sentinelErr
+				}
+			},
+			configureClient: func(config *Config, called *bool) {
+				config.VerifyPeerCertificate = nil
+			},
+			validate: func(t *testing.T, testNo int, clientCalled, serverCalled bool, clientErr, serverErr error) {
+				if serverErr != sentinelErr {
+					t.Errorf("#%d: got server error %v, wanted sentinelErr", testNo, serverErr)
+				}
+			},
+		},
+		{
+			configureServer: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = false
+			},
+			configureClient: func(config *Config, called *bool) {
+				config.VerifyPeerCertificate = func(rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+					return sentinelErr
+				}
+			},
+			validate: func(t *testing.T, testNo int, clientCalled, serverCalled bool, clientErr, serverErr error) {
+				if clientErr != sentinelErr {
+					t.Errorf("#%d: got client error %v, wanted sentinelErr", testNo, clientErr)
+				}
+			},
+		},
+		{
+			configureServer: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = false
+			},
+			configureClient: func(config *Config, called *bool) {
+				config.InsecureSkipVerify = true
+				config.VerifyPeerCertificate = func(rawCerts [][]byte, validatedChains [][]*x509.Certificate) error {
+					if l := len(rawCerts); l != 1 {
+						return fmt.Errorf("got len(rawCerts) = %d, wanted 1", l)
+					}
+					// With InsecureSkipVerify set, this
+					// callback should still be called but
+					// validatedChains must be empty.
+					if l := len(validatedChains); l != 0 {
+						return errors.New("got len(validatedChains) = 0, wanted zero")
+					}
+					*called = true
+					return nil
+				}
+			},
+			validate: func(t *testing.T, testNo int, clientCalled, serverCalled bool, clientErr, serverErr error) {
+				if clientErr != nil {
+					t.Errorf("#%d: client handshake failed: %v", testNo, clientErr)
+				}
+				if serverErr != nil {
+					t.Errorf("#%d: server handshake failed: %v", testNo, serverErr)
+				}
+				if !clientCalled {
+					t.Error("#%d: client did not call callback", testNo)
+				}
+			},
+		},
+	}
+
+	for i, test := range tests {
+		c, s := net.Pipe()
+		done := make(chan error)
+
+		var clientCalled, serverCalled bool
+
+		go func() {
+			config := testConfig.Clone()
+			config.ServerName = "example.golang"
+			config.ClientAuth = RequireAndVerifyClientCert
+			config.ClientCAs = rootCAs
+			config.Time = now
+			test.configureServer(config, &serverCalled)
+
+			err = Server(s, config).Handshake()
+			s.Close()
+			done <- err
+		}()
+
+		config := testConfig.Clone()
+		config.ServerName = "example.golang"
+		config.RootCAs = rootCAs
+		config.Time = now
+		test.configureClient(config, &clientCalled)
+		clientErr := Client(c, config).Handshake()
+		c.Close()
+		serverErr := <-done
+
+		test.validate(t, i, clientCalled, serverCalled, clientErr, serverErr)
 	}
 }
 

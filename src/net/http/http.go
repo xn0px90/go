@@ -5,7 +5,10 @@
 package http
 
 import (
+	"io"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang_org/x/net/lex/httplex"
@@ -14,6 +17,10 @@ import (
 // maxInt64 is the effective "infinite" value for the Server and
 // Transport's byte-limiting readers.
 const maxInt64 = 1<<63 - 1
+
+// aLongTimeAgo is a non-zero time, far in the past, used for
+// immediate cancelation of network operations.
+var aLongTimeAgo = time.Unix(233431200, 0)
 
 // TODO(bradfitz): move common stuff here. The other files have accumulated
 // generic http stuff in random places.
@@ -51,3 +58,45 @@ func isASCII(s string) bool {
 	}
 	return true
 }
+
+func hexEscapeNonASCII(s string) string {
+	newLen := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			newLen += 3
+		} else {
+			newLen++
+		}
+	}
+	if newLen == len(s) {
+		return s
+	}
+	b := make([]byte, 0, newLen)
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			b = append(b, '%')
+			b = strconv.AppendInt(b, int64(s[i]), 16)
+		} else {
+			b = append(b, s[i])
+		}
+	}
+	return string(b)
+}
+
+// NoBody is an io.ReadCloser with no bytes. Read always returns EOF
+// and Close always returns nil. It can be used in an outgoing client
+// request to explicitly signal that a request has zero bytes.
+// An alternative, however, is to simply set Request.Body to nil.
+var NoBody = noBody{}
+
+type noBody struct{}
+
+func (noBody) Read([]byte) (int, error)         { return 0, io.EOF }
+func (noBody) Close() error                     { return nil }
+func (noBody) WriteTo(io.Writer) (int64, error) { return 0, nil }
+
+var (
+	// verify that an io.Copy from NoBody won't require a buffer:
+	_ io.WriterTo   = NoBody
+	_ io.ReadCloser = NoBody
+)

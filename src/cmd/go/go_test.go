@@ -1180,6 +1180,23 @@ func TestIssue10952(t *testing.T) {
 	tg.run("get", "-d", "-u", importPath)
 }
 
+func TestIssue16471(t *testing.T) {
+	testenv.MustHaveExternalNetwork(t)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("skipping because git binary not found")
+	}
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.tempDir("src")
+	tg.setenv("GOPATH", tg.path("."))
+	tg.must(os.MkdirAll(tg.path("src/rsc.io/go-get-issue-10952"), 0755))
+	tg.runGit(tg.path("src/rsc.io"), "clone", "https://github.com/zombiezen/go-get-issue-10952")
+	tg.runFail("get", "-u", "rsc.io/go-get-issue-10952")
+	tg.grepStderr("rsc.io/go-get-issue-10952 is a custom import path for https://github.com/rsc/go-get-issue-10952, but .* is checked out from https://github.com/zombiezen/go-get-issue-10952", "did not detect updated import path")
+}
+
 // Test git clone URL that uses SCP-like syntax and custom import path checking.
 func TestIssue11457(t *testing.T) {
 	testenv.MustHaveExternalNetwork(t)
@@ -1703,6 +1720,16 @@ func TestGoTestDashOWritesBinary(t *testing.T) {
 	tg.wantExecutable(tg.path("myerrors.test"+exeSuffix), "go test -o myerrors.test did not create myerrors.test")
 }
 
+func TestGoTestDashIDashOWritesBinary(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.parallel()
+	tg.makeTempdir()
+	tg.run("test", "-v", "-i", "-o", tg.path("myerrors.test"+exeSuffix), "errors")
+	tg.grepBothNot("PASS|FAIL", "test should not have run")
+	tg.wantExecutable(tg.path("myerrors.test"+exeSuffix), "go test -o myerrors.test did not create myerrors.test")
+}
+
 // Issue 4568.
 func TestSymlinksList(t *testing.T) {
 	switch runtime.GOOS {
@@ -1747,6 +1774,27 @@ func TestSymlinksVendor(t *testing.T) {
 	tg.run("run", "p.go")
 	tg.run("build")
 	tg.run("install")
+}
+
+// Issue 15201.
+func TestSymlinksVendor15201(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9", "windows":
+		t.Skipf("skipping symlink test on %s", runtime.GOOS)
+	}
+
+	tg := testgo(t)
+	defer tg.cleanup()
+
+	tg.tempDir("gopath/src/x/y/_vendor/src/x")
+	tg.must(os.Symlink("../../..", tg.path("gopath/src/x/y/_vendor/src/x/y")))
+	tg.tempFile("gopath/src/x/y/w/w.go", "package w\nimport \"x/y/z\"\n")
+	tg.must(os.Symlink("../_vendor/src", tg.path("gopath/src/x/y/w/vendor")))
+	tg.tempFile("gopath/src/x/y/z/z.go", "package z\n")
+
+	tg.setenv("GOPATH", tg.path("gopath/src/x/y/_vendor")+string(filepath.ListSeparator)+tg.path("gopath"))
+	tg.cd(tg.path("gopath/src"))
+	tg.run("list", "./...")
 }
 
 func TestSymlinksInternal(t *testing.T) {
@@ -2316,6 +2364,20 @@ func TestGoGenerateEnv(t *testing.T) {
 	for _, v := range []string{"GOARCH", "GOOS", "GOFILE", "GOLINE", "GOPACKAGE", "DOLLAR"} {
 		tg.grepStdout("^"+v+"=", "go generate environment missing "+v)
 	}
+}
+
+func TestGoGenerateBadImports(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping because windows has no echo command")
+	}
+
+	// This package has an invalid import causing an import cycle,
+	// but go generate is supposed to still run.
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.setenv("GOPATH", filepath.Join(tg.pwd(), "testdata"))
+	tg.run("generate", "gencycle")
+	tg.grepStdout("hello world", "go generate gencycle did not run generator")
 }
 
 func TestGoGetCustomDomainWildcard(t *testing.T) {
@@ -2918,6 +2980,16 @@ func TestBinaryOnlyPackages(t *testing.T) {
 
 	tg.run("run", tg.path("src/p3/p3.go"))
 	tg.grepStdout("hello from p1", "did not see message from p1")
+
+	tg.tempFile("src/p4/p4.go", `package main`)
+	tg.tempFile("src/p4/p4not.go", `//go:binary-only-package
+
+		// +build asdf
+
+		package main
+	`)
+	tg.run("list", "-f", "{{.BinaryOnly}}", "p4")
+	tg.grepStdout("false", "did not see BinaryOnly=false for p4")
 }
 
 // Issue 16050.
@@ -2964,4 +3036,146 @@ func TestGenerateUsesBuildContext(t *testing.T) {
 	tg.setenv("GOARCH", "386")
 	tg.run("generate", "gen")
 	tg.grepStdout("darwin 386", "unexpected GOOS/GOARCH combination")
+}
+
+// Issue 14450: go get -u .../ tried to import not downloaded package
+func TestGoGetUpdateWithWildcard(t *testing.T) {
+	testenv.MustHaveExternalNetwork(t)
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.makeTempdir()
+	tg.setenv("GOPATH", tg.path("."))
+	const aPkgImportPath = "github.com/tmwh/go-get-issue-14450/a"
+	tg.run("get", aPkgImportPath)
+	tg.run("get", "-u", ".../")
+	tg.grepStderrNot("cannot find package", "did not update packages given wildcard path")
+
+	var expectedPkgPaths = []string{
+		"src/github.com/tmwh/go-get-issue-14450/b",
+		"src/github.com/tmwh/go-get-issue-14450-b-dependency/c",
+		"src/github.com/tmwh/go-get-issue-14450-b-dependency/d",
+	}
+
+	for _, importPath := range expectedPkgPaths {
+		_, err := os.Stat(tg.path(importPath))
+		tg.must(err)
+	}
+	const notExpectedPkgPath = "src/github.com/tmwh/go-get-issue-14450-c-dependency/e"
+	tg.mustNotExist(tg.path(notExpectedPkgPath))
+}
+
+func TestGoEnv(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.setenv("GOARCH", "arm")
+	tg.run("env", "GOARCH")
+	tg.grepStdout("^arm$", "GOARCH not honored")
+
+	tg.run("env", "GCCGO")
+	tg.grepStdout(".", "GCCGO unexpectedly empty")
+
+	tg.run("env", "CGO_CFLAGS")
+	tg.grepStdout(".", "default CGO_CFLAGS unexpectedly empty")
+
+	tg.setenv("CGO_CFLAGS", "-foobar")
+	tg.run("env", "CGO_CFLAGS")
+	tg.grepStdout("^-foobar$", "CGO_CFLAGS not honored")
+}
+
+const (
+	noMatchesPattern = `(?m)^ok.*\[no tests to run\]`
+	okPattern        = `(?m)^ok`
+)
+
+func TestMatchesNoTests(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "ThisWillNotMatch", "testdata/standalone_test.go")
+	tg.grepBoth(noMatchesPattern, "go test did not say [no tests to run]")
+}
+
+func TestMatchesNoTestsDoesNotOverrideBuildFailure(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.setenv("GOPATH", filepath.Join(tg.pwd(), "testdata"))
+	tg.runFail("test", "-run", "ThisWillNotMatch", "syntaxerror")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth("FAIL", "go test did not say FAIL")
+}
+
+func TestMatchesNoBenchmarks(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-bench", "ThisWillNotMatch", "testdata/standalone_benchmark_test.go")
+	tg.grepBoth(noMatchesPattern, "go test did not say [no tests to run]")
+}
+
+func TestMatchesOnlyExampleIsOK(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Example", "testdata/example1_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth(okPattern, "go test did not say ok")
+}
+
+func TestMatchesOnlyBenchmarkIsOK(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-bench", ".", "testdata/standalone_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth(okPattern, "go test did not say ok")
+}
+
+func TestMatchesOnlyTestIsOK(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Test", "testdata/standalone_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth(okPattern, "go test did not say ok")
+}
+
+func TestMatchesNoTestsWithSubtests(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "ThisWillNotMatch", "testdata/standalone_sub_test.go")
+	tg.grepBoth(noMatchesPattern, "go test did not say [no tests to run]")
+}
+
+func TestMatchesNoSubtestsMatch(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Test/ThisWillNotMatch", "testdata/standalone_sub_test.go")
+	tg.grepBoth(noMatchesPattern, "go test did not say [no tests to run]")
+}
+
+func TestMatchesNoSubtestsDoesNotOverrideFailure(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.runFail("test", "-run", "TestThatFails/ThisWillNotMatch", "testdata/standalone_fail_sub_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth("FAIL", "go test did not say FAIL")
+}
+
+func TestMatchesOnlySubtestIsOK(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Test/Sub", "testdata/standalone_sub_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth(okPattern, "go test did not say ok")
+}
+
+func TestMatchesNoSubtestsParallel(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Test/Sub/ThisWillNotMatch", "testdata/standalone_parallel_sub_test.go")
+	tg.grepBoth(noMatchesPattern, "go test did not say [no tests to run]")
+}
+
+func TestMatchesOnlySubtestParallelIsOK(t *testing.T) {
+	tg := testgo(t)
+	defer tg.cleanup()
+	tg.run("test", "-run", "Test/Sub/Nested", "testdata/standalone_parallel_sub_test.go")
+	tg.grepBothNot(noMatchesPattern, "go test did say [no tests to run]")
+	tg.grepBoth(okPattern, "go test did not say ok")
 }

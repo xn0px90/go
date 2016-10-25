@@ -95,6 +95,7 @@ const (
 	CurveP256 CurveID = 23
 	CurveP384 CurveID = 24
 	CurveP521 CurveID = 25
+	X25519    CurveID = 29
 )
 
 // TLS Elliptic Curve Point Formats
@@ -302,7 +303,39 @@ type Config struct {
 	// If GetCertificate is nil or returns nil, then the certificate is
 	// retrieved from NameToCertificate. If NameToCertificate is nil, the
 	// first element of Certificates will be used.
-	GetCertificate func(clientHello *ClientHelloInfo) (*Certificate, error)
+	GetCertificate func(*ClientHelloInfo) (*Certificate, error)
+
+	// GetConfigForClient, if not nil, is called after a ClientHello is
+	// received from a client. It may return a non-nil Config in order to
+	// change the Config that will be used to handle this connection. If
+	// the returned Config is nil, the original Config will be used. The
+	// Config returned by this callback may not be subsequently modified.
+	//
+	// If GetConfigForClient is nil, the Config passed to Server() will be
+	// used for all connections.
+	//
+	// Uniquely for the fields in the returned Config, session ticket keys
+	// will be duplicated from the original Config if not set.
+	// Specifically, if SetSessionTicketKeys was called on the original
+	// config but not on the returned config then the ticket keys from the
+	// original config will be copied into the new config before use.
+	// Otherwise, if SessionTicketKey was set in the original config but
+	// not in the returned config then it will be copied into the returned
+	// config before use. If neither of those cases applies then the key
+	// material from the returned config will be used for session tickets.
+	GetConfigForClient func(*ClientHelloInfo) (*Config, error)
+
+	// VerifyPeerCertificate, if not nil, is called after normal
+	// certificate verification by either a TLS client or server. It
+	// receives the raw ASN.1 certificates provided by the peer and also
+	// any verified chains that normal processing found. If it returns a
+	// non-nil error, the handshake is aborted and that error results.
+	//
+	// If normal verification fails then the handshake will abort before
+	// considering this callback. If normal verification is disabled by
+	// setting InsecureSkipVerify then this callback will be considered but
+	// the verifiedChains argument will always be nil.
+	VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 
 	// RootCAs defines the set of root certificate authorities
 	// that clients use when verifying server certificates.
@@ -397,13 +430,17 @@ type Config struct {
 
 	serverInitOnce sync.Once // guards calling (*Config).serverInit
 
-	// mutex protects sessionTicketKeys
+	// mutex protects sessionTicketKeys and originalConfig.
 	mutex sync.RWMutex
 	// sessionTicketKeys contains zero or more ticket keys. If the length
 	// is zero, SessionTicketsDisabled must be true. The first key is used
 	// for new tickets and any subsequent keys can be used to decrypt old
 	// tickets.
 	sessionTicketKeys []ticketKey
+	// originalConfig is set to the Config that was passed to Server if
+	// this Config is returned by a GetConfigForClient callback. It's used
+	// by serverInit in order to copy session ticket keys if needed.
+	originalConfig *Config
 }
 
 // ticketKeyNameLen is the number of bytes of identifier that is prepended to
@@ -430,15 +467,26 @@ func ticketKeyFromBytes(b [32]byte) (key ticketKey) {
 	return key
 }
 
-// Clone returns a shallow clone of c.
-// Only the exported fields are copied.
+// Clone returns a shallow clone of c. It is safe to clone a Config that is
+// being used concurrently by a TLS client or server.
 func (c *Config) Clone() *Config {
+	// Running serverInit ensures that it's safe to read
+	// SessionTicketsDisabled.
+	c.serverInitOnce.Do(c.serverInit)
+
+	var sessionTicketKeys []ticketKey
+	c.mutex.RLock()
+	sessionTicketKeys = c.sessionTicketKeys
+	c.mutex.RUnlock()
+
 	return &Config{
 		Rand:                        c.Rand,
 		Time:                        c.Time,
 		Certificates:                c.Certificates,
 		NameToCertificate:           c.NameToCertificate,
 		GetCertificate:              c.GetCertificate,
+		GetConfigForClient:          c.GetConfigForClient,
+		VerifyPeerCertificate:       c.VerifyPeerCertificate,
 		RootCAs:                     c.RootCAs,
 		NextProtos:                  c.NextProtos,
 		ServerName:                  c.ServerName,
@@ -456,6 +504,8 @@ func (c *Config) Clone() *Config {
 		DynamicRecordSizingDisabled: c.DynamicRecordSizingDisabled,
 		Renegotiation:               c.Renegotiation,
 		KeyLogWriter:                c.KeyLogWriter,
+		sessionTicketKeys:           sessionTicketKeys,
+		// originalConfig is deliberately not duplicated.
 	}
 }
 
@@ -463,6 +513,11 @@ func (c *Config) serverInit() {
 	if c.SessionTicketsDisabled || len(c.ticketKeys()) != 0 {
 		return
 	}
+
+	var originalConfig *Config
+	c.mutex.Lock()
+	originalConfig, c.originalConfig = c.originalConfig, nil
+	c.mutex.Unlock()
 
 	alreadySet := false
 	for _, b := range c.SessionTicketKey {
@@ -473,13 +528,21 @@ func (c *Config) serverInit() {
 	}
 
 	if !alreadySet {
-		if _, err := io.ReadFull(c.rand(), c.SessionTicketKey[:]); err != nil {
+		if originalConfig != nil {
+			copy(c.SessionTicketKey[:], originalConfig.SessionTicketKey[:])
+		} else if _, err := io.ReadFull(c.rand(), c.SessionTicketKey[:]); err != nil {
 			c.SessionTicketsDisabled = true
 			return
 		}
 	}
 
-	c.sessionTicketKeys = []ticketKey{ticketKeyFromBytes(c.SessionTicketKey)}
+	if originalConfig != nil {
+		originalConfig.mutex.RLock()
+		c.sessionTicketKeys = originalConfig.sessionTicketKeys
+		originalConfig.mutex.RUnlock()
+	} else {
+		c.sessionTicketKeys = []ticketKey{ticketKeyFromBytes(c.SessionTicketKey)}
+	}
 }
 
 func (c *Config) ticketKeys() []ticketKey {
@@ -549,7 +612,7 @@ func (c *Config) maxVersion() uint16 {
 	return c.MaxVersion
 }
 
-var defaultCurvePreferences = []CurveID{CurveP256, CurveP384, CurveP521}
+var defaultCurvePreferences = []CurveID{X25519, CurveP256, CurveP384, CurveP521}
 
 func (c *Config) curvePreferences() []CurveID {
 	if c == nil || len(c.CurvePreferences) == 0 {

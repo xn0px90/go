@@ -62,6 +62,9 @@ Go library.
 - "cmd" expands to the Go repository's commands and their
 internal libraries.
 
+Import paths beginning with "cmd/" only match source code in
+the Go repository.
+
 An import path is a pattern if it includes one or more "..." wildcards,
 each of which can match any string, including the empty string and
 strings containing slashes.  Such a pattern expands to all package
@@ -196,6 +199,11 @@ example.org/repo or repo.git.
 When a version control system supports multiple protocols,
 each is tried in turn when downloading.  For example, a Git
 download tries https://, then git+ssh://.
+
+By default, downloads are restricted to known secure protocols
+(e.g. https, ssh). To override this setting for Git downloads, the
+GIT_ALLOW_PROTOCOL environment variable can be set (For more details see:
+'go help environment').
 
 If the import path is not a known code hosting site and also lacks a
 version control qualifier, the go tool attempts to fetch the import
@@ -461,10 +469,15 @@ Environment variables for use with cgo:
 	CGO_CXXFLAGS
 		Flags that cgo will pass to the compiler when compiling
 		C++ code.
+	CGO_FFLAGS
+		Flags that cgo will pass to the compiler when compiling
+		Fortran code.
 	CGO_LDFLAGS
 		Flags that cgo will pass to the compiler when linking.
 	CXX
 		The command to use to compile C++ code.
+	PKG_CONFIG
+		Path to pkg-config tool.
 
 Architecture-specific environment variables:
 
@@ -486,6 +499,10 @@ Special-purpose environment variables:
 		Whether the linker should use external linking mode
 		when using -linkmode=auto with code that uses cgo.
 		Set to 0 to disable external linking mode, 1 to enable it.
+	GIT_ALLOW_PROTOCOL
+		Defined by Git. A colon-separated list of schemes that are allowed to be used
+		with git fetch/clone. If set, any scheme not explicitly mentioned will be
+		considered insecure by 'go get'.
 	`,
 }
 

@@ -59,7 +59,6 @@ var pkgDeps = map[string][]string{
 	"math":          {"unsafe"},
 	"math/cmplx":    {"math"},
 	"math/rand":     {"L0", "math"},
-	"sort":          {},
 	"strconv":       {"L0", "unicode/utf8", "math"},
 	"unicode/utf16": {},
 	"unicode/utf8":  {},
@@ -109,6 +108,7 @@ var pkgDeps = map[string][]string{
 	"image/color":         {"L2"},                // interfaces
 	"image/color/palette": {"L2", "image/color"},
 	"reflect":             {"L2"},
+	"sort":                {"reflect"},
 
 	"L3": {
 		"L2",
@@ -298,7 +298,7 @@ var pkgDeps = map[string][]string{
 		"context", "math/rand", "os", "sort", "syscall", "time",
 		"internal/nettrace",
 		"internal/syscall/windows", "internal/singleflight", "internal/race",
-		"golang_org/x/net/route",
+		"golang_org/x/net/lif", "golang_org/x/net/route",
 	},
 
 	// NET enables use of basic network-related packages.
@@ -333,6 +333,9 @@ var pkgDeps = map[string][]string{
 		"crypto/sha1",
 		"crypto/sha256",
 		"crypto/sha512",
+		"golang_org/x/crypto/chacha20poly1305",
+		"golang_org/x/crypto/curve25519",
+		"golang_org/x/crypto/poly1305",
 	},
 
 	// Random byte, number generation.
@@ -393,7 +396,7 @@ var pkgDeps = map[string][]string{
 		"runtime/debug",
 	},
 	"net/http/internal":  {"L4"},
-	"net/http/httptrace": {"context", "internal/nettrace", "net", "reflect", "time"},
+	"net/http/httptrace": {"context", "crypto/tls", "internal/nettrace", "net", "reflect", "time"},
 
 	// HTTP-using packages.
 	"expvar":             {"L4", "OS", "encoding/json", "net/http"},
